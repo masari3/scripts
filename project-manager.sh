@@ -1,11 +1,95 @@
 #!/bin/bash
 
-# UPDATED PATHS BASED ON NEW STRUCTURE
-PROJECTS_ROOT="$HOME/projects/www"
-SCRIPTS_ROOT="$HOME/projects/scripts"
+# UPDATED PATHS - SESUAI DENGAN FIX YANG BEKERJA
+PROJECTS_ROOT="/mnt/d/projects/www"  # ← PATH YANG BENAR
+SCRIPTS_ROOT="/mnt/d/projects/scripts"
 NGINX_AVAILABLE="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
 HOSTS_FILE="/mnt/c/Windows/System32/drivers/etc/hosts"
+
+# Function to detect PHP version
+detect_php_version() {
+    # Check for available PHP versions
+    if [ -S "/var/run/php/php8.2-fpm.sock" ]; then
+        echo "8.2"
+    elif [ -S "/var/run/php/php8.1-fpm.sock" ]; then
+        echo "8.1"
+    elif [ -S "/var/run/php/php7.4-fpm.sock" ]; then
+        echo "7.4"
+    else
+        # Fallback: check which PHP-FPM services are available
+        if systemctl is-active --quiet php8.2-fpm; then
+            echo "8.2"
+        elif systemctl is-active --quiet php8.1-fpm; then
+            echo "8.1"
+        elif systemctl is-active --quiet php7.4-fpm; then
+            echo "7.4"
+        else
+            echo "8.2"  # Default fallback
+        fi
+    fi
+}
+
+# Function to get PHP-FPM connection string
+get_php_fpm_connection() {
+    local php_version=$(detect_php_version)
+    
+    # Check if socket exists for detected version
+    if [ -S "/var/run/php/php${php_version}-fpm.sock" ]; then
+        echo "unix:/var/run/php/php${php_version}-fpm.sock"
+    else
+        # Fallback to TCP
+        echo "127.0.0.1:9000"
+    fi
+}
+
+# Function to show PHP version information
+show_php_info() {
+    echo "🔍 PHP Version Information"
+    echo "========================="
+    
+    # Check PHP CLI version
+    echo "📟 PHP CLI:"
+    php -v 2>/dev/null | head -1 || echo "❌ PHP CLI not found"
+    
+    # Check available PHP-FPM versions
+    echo ""
+    echo "🚀 PHP-FPM Services:"
+    for version in 8.2 8.1 7.4; do
+        if systemctl is-active --quiet "php${version}-fpm"; then
+            echo "   ✅ php${version}-fpm: ACTIVE"
+        elif systemctl is-enabled --quiet "php${version}-fpm"; then
+            echo "   ❌ php${version}-fpm: INSTALLED but not active"
+        else
+            echo "   ⚠️  php${version}-fpm: NOT FOUND"
+        fi
+    done
+    
+    # Check sockets
+    echo ""
+    echo "🔌 PHP-FPM Sockets:"
+    ls -la /var/run/php/ 2>/dev/null | grep sock || echo "   No sockets found"
+    
+    # Detected version
+    echo ""
+    echo "🎯 Auto-detected:"
+    echo "   Version: $(detect_php_version)"
+    echo "   Connection: $(get_php_fpm_connection)"
+}
+
+# Function to setup symlink
+setup_symlink() {
+    echo "🔗 Setting up symlink..."
+    
+    # Hapus symlink lama jika ada
+    sudo rm -f /var/www/projects
+    
+    # Buat symlink ke D:\projects\www
+    sudo ln -s "$PROJECTS_ROOT" /var/www/projects
+    
+    echo "✅ Symlink created: /var/www/projects -> $PROJECTS_ROOT"
+    ls -la /var/www/projects
+}
 
 # Function to check if project exists
 project_exists() {
@@ -129,6 +213,13 @@ setup_nginx_config() {
         sudo rm -f "$NGINX_ENABLED/$domain"
     fi
     
+    # Detect PHP version and connection
+    local php_connection=$(get_php_fpm_connection)
+    local php_version=$(detect_php_version)
+    
+    echo "🔍 Detected PHP: $php_version"
+    echo "🔗 PHP-FPM Connection: $php_connection"
+    
     # UPDATED: Define correct root paths for each project type
     local nginx_root_path=""
     case $project_type in
@@ -149,11 +240,7 @@ setup_nginx_config() {
     
     echo "📁 Nginx root path: $nginx_root_path"
     
-    # Detect PHP version
-    local php_version=$(detect_php_version)
-    echo "🔍 Detected PHP version: $php_version"
-    
-    # Create nginx config dengan PHP version yang terdeteksi
+    # Create nginx config dengan path yang benar dan PHP connection yang terdeteksi
     sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
 server {
     listen 80;
@@ -161,6 +248,7 @@ server {
     
     server_name $domain;
     
+    # CORRECT PATH FOR STRUCTURED FOLDERS
     root $nginx_root_path;
     index index.php index.html index.htm;
 
@@ -172,10 +260,9 @@ server {
     }
 
     location ~ \.php\$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/${php_version}-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
+        fastcgi_pass $php_connection;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
     }
 
     location ~ /\.ht {
@@ -205,11 +292,10 @@ EOF
             sudo chmod 755 /var/log/nginx/projects
         fi
         
-        # Check if project directory exists in symlink location
-        local symlink_path="/var/www/projects/$project_type/$project_name"
-        if [ ! -d "$symlink_path" ]; then
-            echo "❌ Project not found in symlink location: $symlink_path"
-            echo "💡 Make sure the project exists in ~/projects/www/$project_type/$project_name"
+        # Check symlink
+        if [ ! -L "/var/www/projects" ]; then
+            echo "🔗 Symlink missing, creating..."
+            setup_symlink
         fi
         
         return 1
@@ -218,6 +304,7 @@ EOF
     echo "🎉 Project setup completed!"
     echo "📁 Local Path: $PROJECTS_ROOT/$project_type/$project_name"
     echo "🌐 Nginx Path: $nginx_root_path"
+    echo "🔗 PHP: $php_version via $php_connection"
     echo "🔗 URL: http://$domain"
 }
 
@@ -225,7 +312,6 @@ EOF
 add_to_hosts() {
     local domain=$1
     
-    # Check if already exists
     if hosts_entry_exists "$domain"; then
         echo "ℹ️  Domain $domain already exists in hosts file"
         return 0
@@ -235,32 +321,15 @@ add_to_hosts() {
     
     # Method 1: Try direct PowerShell command
     if powershell.exe -Command "Add-Content -Path 'C:\Windows\System32\drivers\etc\hosts' -Value '127.0.0.1 $domain' -Force" 2>/dev/null; then
-        echo "✅ Added $domain to hosts file (Method 1)"
+        echo "✅ Added $domain to hosts file"
         return 0
     fi
     
-    # Method 2: Try with Start-Process (Run as Admin)
-    if powershell.exe -Command "Start-Process PowerShell -ArgumentList '-Command', 'Add-Content -Path \\\"C:\Windows\System32\drivers\etc\hosts\\\" -Value \\\"127.0.0.1 $domain\\\" -Force' -Verb RunAs" 2>/dev/null; then
-        echo "✅ Added $domain to hosts file (Method 2 - Admin)"
-        return 0
-    fi
-    
-    # Method 3: Manual echo to hosts file via WSL
-    echo "Trying WSL method..."
-    if echo "127.0.0.1 $domain" | sudo tee -a /mnt/c/Windows/System32/drivers/etc/hosts > /dev/null 2>&1; then
-        echo "✅ Added $domain to hosts file (Method 3 - WSL)"
-        return 0
-    fi
-    
-    # Method 4: Final fallback - manual instruction
+    # Method 2: Manual instruction
     echo "❌ Failed to add $domain to hosts file automatically"
     echo "📝 Please manually add this line to C:\\Windows\\System32\\drivers\\etc\\hosts:"
     echo "   127.0.0.1 $domain"
-    echo ""
-    echo "💡 Quick manual fix:"
-    echo "   1. Press Win + X, then A (Windows Terminal Admin)"
-    echo "   2. Run: Add-Content -Path 'C:\\Windows\\System32\\drivers\\etc\\hosts' -Value '127.0.0.1 $domain'"
-    echo "   3. Or use Notepad as Administrator"
+    echo "   (Run Notepad as Administrator to edit hosts file)"
 }
 
 # Function to setup ONLY nginx config for existing project
@@ -285,45 +354,10 @@ setup_existing_project() {
     setup_nginx_config "$project_type" "$project_name" "$domain"
 }
 
-# Function to migrate flat project to structured
-migrate_project() {
-    local project_name=$1
-    local project_type=$2
-    local domain=$3
-    
-    if [ -z "$project_name" ] || [ -z "$project_type" ]; then
-        echo "Usage: migrate_project <project-name> <project-type> [domain]"
-        echo "Example: migrate_project pmb codeigniter3 pmb.test"
-        return 1
-    fi
-    
-    local flat_path="$PROJECTS_ROOT/$project_name"
-    local structured_path="$PROJECTS_ROOT/$project_type/$project_name"
-    
-    if [ ! -d "$flat_path" ]; then
-        echo "❌ Project not found in flat structure: $flat_path"
-        return 1
-    fi
-    
-    if [ -d "$structured_path" ]; then
-        echo "⚠️  Project already exists in structured location: $structured_path"
-        echo "   Using existing structured project"
-    else
-        echo "🚚 Moving project from flat to structured location..."
-        mkdir -p "$PROJECTS_ROOT/$project_type"
-        mv "$flat_path" "$structured_path"
-        echo "✅ Moved to: $structured_path"
-    fi
-    
-    # Setup nginx config
-    local final_domain=${domain:-"$project_name.test"}
-    setup_nginx_config "$project_type" "$project_name" "$final_domain"
-}
-
 # Function to list all projects with status
 list_projects() {
-    echo "📂 Projects Overview - Structured Location: ~/projects/www/<type>/<project>"
-    echo "========================================================================"
+    echo "📂 Projects Overview - Correct Location: $PROJECTS_ROOT/<type>/<project>"
+    echo "======================================================================"
     
     # Check each project type
     for project_type in laravel nextjs codeigniter3; do
@@ -346,17 +380,6 @@ list_projects() {
             done
         else
             echo "   No $project_type projects"
-        fi
-    done
-    
-    # Check for flat projects (old structure)
-    echo ""
-    echo "📁 Flat Projects (to be migrated):"
-    find "$PROJECTS_ROOT" -maxdepth 1 -type d | tail -n +2 | while read dir; do
-        local name=$(basename "$dir")
-        # Skip if it's a project type folder
-        if [[ "$name" != "laravel" && "$name" != "nextjs" && "$name" != "codeigniter3" ]]; then
-            echo "   📦 $name (needs migration)"
         fi
     done
     
@@ -435,20 +458,6 @@ delete_project() {
     echo "🎉 Cleanup completed!"
 }
 
-# Function to detect PHP version
-detect_php_version() {
-    # Check for available PHP versions
-    if [ -S "/var/run/php/php8.2-fpm.sock" ]; then
-        echo "php8.2"
-    elif [ -S "/var/run/php/php8.1-fpm.sock" ]; then
-        echo "php8.1"
-    elif [ -S "/var/run/php/php7.4-fpm.sock" ]; then
-        echo "php7.4"
-    else
-        echo "php8.1"  # fallback
-    fi
-}
-
 # Function to fix project (recreate nginx config)
 fix_project() {
     local project_type=$1
@@ -469,95 +478,21 @@ fix_project() {
     setup_nginx_config "$project_type" "$project_name" "$domain"
 }
 
-# Function to fix symlink
-fix_symlink() {
-    echo "🔗 Checking symlink..."
-    
-    if [ -L "/var/www/projects" ]; then
-        local current_target=$(readlink /var/www/projects)
-        echo "ℹ️  Current symlink: /var/www/projects -> $current_target"
-        
-        if [ "$current_target" != "$HOME/projects/www" ]; then
-            echo "🔄 Updating symlink to new location..."
-            sudo rm -f /var/www/projects
-            sudo ln -s "$HOME/projects/www" /var/www/projects
-            echo "✅ Symlink updated"
-        else
-            echo "✅ Symlink already points to correct location"
-        fi
-    else
-        echo "🔗 Creating new symlink..."
-        sudo ln -s "$HOME/projects/www" /var/www/projects
-        echo "✅ Symlink created: /var/www/projects -> $HOME/projects/www"
-    fi
-    
-    echo "🔗 Final symlink status:"
-    ls -la /var/www/projects
-}
-
-# Function to fix permissions for projects
-fix_permissions() {
+# Function to fix permissions for NTFS
+fix_ntfs_permissions() {
     local project_type=$1
     local project_name=$2
     
     if [ -z "$project_type" ] || [ -z "$project_name" ]; then
-        echo "Usage: fix_permissions <laravel|nextjs|codeigniter3> <project-name>"
+        echo "Usage: fix_ntfs_permissions <laravel|nextjs|codeigniter3> <project-name>"
         return 1
     fi
     
-    local project_path="/var/www/projects/$project_type/$project_name"
+    echo "🔧 Applying NTFS permission fix for: $project_type/$project_name"
     
-    if [ ! -d "$project_path" ]; then
-        echo "❌ Project not found: $project_path"
-        return 1
-    fi
-    
-    echo "🔧 Fixing permissions for: $project_path"
-    
-    # Set ownership to www-data but keep user access
-    sudo chown -R $USER:www-data "$project_path"
-    
-    # Set directory permissions
-    sudo find "$project_path" -type d -exec sudo chmod 755 {} \;
-    
-    # Set file permissions
-    sudo find "$project_path" -type f -exec sudo chmod 644 {} \;
-    
-    # Framework-specific permission fixes
-    case $project_type in
-        "codeigniter3")
-            if [ -d "$project_path/application/cache" ]; then
-                sudo chmod -R 775 "$project_path/application/cache"
-                echo "✅ Fixed cache permissions"
-            fi
-            if [ -d "$project_path/application/logs" ]; then
-                sudo chmod -R 775 "$project_path/application/logs"
-                echo "✅ Fixed logs permissions"
-            fi
-            if [ -d "$project_path/uploads" ]; then
-                sudo chmod -R 775 "$project_path/uploads"
-                echo "✅ Fixed uploads permissions"
-            fi
-            ;;
-        "laravel")
-            if [ -d "$project_path/storage" ]; then
-                sudo chmod -R 775 "$project_path/storage"
-                echo "✅ Fixed storage permissions"
-            fi
-            if [ -d "$project_path/bootstrap/cache" ]; then
-                sudo chmod -R 775 "$project_path/bootstrap/cache"
-                echo "✅ Fixed bootstrap cache permissions"
-            fi
-            ;;
-    esac
-    
-    echo "✅ Permissions fixed for $project_name"
-    
-    # Restart services
-    sudo service nginx reload
-    sudo service php8.1-fpm restart
-    
-    echo "✅ Services reloaded"
+    # For NTFS, we use TCP connection so no special permission needed
+    echo "✅ NTFS projects use TCP connection - no special permissions needed"
+    echo "💡 Using TCP connection to PHP-FPM on 127.0.0.1:9000"
 }
 
 # Main function dispatcher
@@ -568,9 +503,6 @@ project_manager() {
             ;;
         "setup")
             setup_existing_project $2 $3 $4
-            ;;
-        "migrate")
-            migrate_project $2 $3 $4
             ;;
         "list")
             list_projects
@@ -584,11 +516,11 @@ project_manager() {
         "fix")
             fix_project $2 $3 $4
             ;;
-        "permissions")    # ← BARU DITAMBAHKAN
-            fix_permissions $2 $3
-            ;;
         "symlink")
-            fix_symlink
+            setup_symlink
+            ;;
+        "permissions")
+            fix_ntfs_permissions $2 $3
             ;;
         "hosts")
             add_to_hosts $2
@@ -596,42 +528,47 @@ project_manager() {
         "exists")
             project_exists $2 $3 && echo "✅ Project exists" || echo "❌ Project not found"
             ;;
+        "php-info")
+            show_php_info
+            ;;
         "path")
             echo "📁 Project Root: $PROJECTS_ROOT"
             echo "📁 Scripts Root: $SCRIPTS_ROOT"
-            echo "🔗 Nginx Root: /var/www/projects"
+            echo "🔗 Nginx Root: /var/www/projects -> $(readlink /var/www/projects 2>/dev/null || echo 'Not set')"
+            echo "🔗 PHP-FPM: $(get_php_fpm_connection)"
             echo "📁 Nginx Paths:"
             echo "   - Laravel: /var/www/projects/laravel/{project}/public"
             echo "   - NextJS: /var/www/projects/nextjs/{project}"
             echo "   - CodeIgniter3: /var/www/projects/codeigniter3/{project}"
             ;;
         *)
-            echo "🏗️  Project Manager - Structured Setup"
-            echo "======================================"
-            echo "📁 Project Location: ~/projects/www/<type>/<project>"
-            echo "📁 Scripts Location: ~/projects/scripts/"
+            echo "🏗️  Project Manager - FIXED SETUP"
+            echo "================================"
+            echo "📁 Project Location: $PROJECTS_ROOT/<type>/<project>"
+            echo "📁 Scripts Location: $SCRIPTS_ROOT"
+            echo "🔗 Symlink: /var/www/projects -> $PROJECTS_ROOT"
+            echo "🔗 PHP-FPM: Auto-detected"
             echo ""
             echo "Commands:"
             echo "  create <type> <name> <domain> [force]    - Create new project"
             echo "  setup <type> <name> <domain>            - Setup nginx for existing project"
-            echo "  migrate <name> <type> [domain]          - Move flat project to structured"
             echo "  list                                    - List all projects with status"
             echo "  code <type> <name>                      - Open project in VS Code"
             echo "  delete <type> <name> [remove-files]     - Remove nginx config (and files)"
             echo "  fix <type> <name> [domain]              - Recreate nginx config"
-            echo "  permissions <type> <name>               - Fix file permissions"  # ← BARU
-            echo "  symlink                                 - Fix symlink to new location"
+            echo "  symlink                                 - Setup correct symlink"
+            echo "  permissions <type> <name>               - NTFS permission info"
             echo "  hosts <domain>                          - Add domain to hosts"
             echo "  exists <type> <name>                    - Check if project exists"
+            echo "  php-info                                - Show PHP version info"
             echo "  path                                    - Show all paths"
             echo ""
             echo "Project Types: laravel, nextjs, codeigniter3"
             echo ""
             echo "Examples:"
             echo "  project create laravel myapp myapp.test"
-            echo "  project migrate pmb codeigniter3 pmb.test"
-            echo "  project permissions codeigniter3 pmb    # Fix permission issues"
             echo "  project setup codeigniter3 pmb pmb.test"
+            echo "  project php-info                        # Check PHP version"
             echo "  project symlink"
             echo "  project path"
             echo "  project list"
@@ -643,11 +580,11 @@ project_manager() {
 alias project="project_manager"
 alias pj-create="project_manager create"
 alias pj-setup="project_manager setup"
-alias pj-migrate="project_manager migrate"
 alias pj-list="project_manager list"
 alias pj-code="project_manager code"
 alias pj-delete="project_manager delete"
 alias pj-fix="project_manager fix"
 alias pj-symlink="project_manager symlink"
+alias pj-permissions="project_manager permissions"
+alias pj-php="project_manager php-info"
 alias pj-path="project_manager path"
-alias pj-permissions="project_manager permissions" 
