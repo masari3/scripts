@@ -132,33 +132,144 @@ generate_ssl_cert() {
     # Generate certificate di certs directory
     cd "$CERT_ROOT"
     
-    # Hapus certificate lama jika ada (termasuk yang +1, +2, dll)
-    rm -f "$domain"*.pem
-    rm -f "$domain"-key*.pem
+    # Hapus certificate lama jika ada
+    rm -f "$domain.pem" "$domain-key.pem"
+    rm -f "$domain"+*.pem  # Hapus juga file dengan +number
     
-    # Generate certificate dengan nama yang konsisten
-    if mkcert "$domain" "www.$domain" "localhost.$domain"; then
-        # Cari file certificate yang baru dibuat (bisa dengan +number)
-        local cert_file=$(ls -1 | grep -E "^${domain}(\+[0-9]+)?\.pem$" | head -1)
-        local key_file=$(ls -1 | grep -E "^${domain}(\+[0-9]+)?-key\.pem$" | head -1)
+    # Generate certificate dengan extended validity dan better subject
+    if mkcert -cert-file "$domain.pem" -key-file "$domain-key.pem" \
+        "$domain" "www.$domain" "localhost.$domain" "127.0.0.1" "::1"; then
         
-        if [ -n "$cert_file" ] && [ -n "$key_file" ]; then
-            # Rename file ke nama yang konsisten
-            mv "$cert_file" "$domain.pem"
-            mv "$key_file" "$domain-key.pem"
-            
+        if [ -f "$domain.pem" ] && [ -f "$domain-key.pem" ]; then
             echo "✅ SSL certificate generated:"
             echo "   Cert: $CERT_ROOT/$domain.pem"
             echo "   Key:  $CERT_ROOT/$domain-key.pem"
+            
+            # Display certificate info
+            echo "🔍 Certificate details:"
+            openssl x509 -in "$domain.pem" -text -noout 2>/dev/null | grep -E "Subject:|Issuer:|Not Before|Not After" | head -4
+            
             return 0
         else
-            echo "❌ Certificate files not found after generation"
-            echo "   Available files:"
-            ls -la *.pem 2>/dev/null || echo "   No .pem files found"
+            echo "❌ Certificate files not created properly"
             return 1
         fi
     else
-        echo "❌ Failed to generate SSL certificate"
+        echo "❌ Failed to generate SSL certificate with -cert-file option"
+        echo "💡 Trying fallback method..."
+        
+        # Fallback: generate normally
+        if mkcert "$domain" "www.$domain" "localhost.$domain" "127.0.0.1" "::1"; then
+            # Cari dan rename file yang digenerate
+            for file in *.pem; do
+                if [[ "$file" == "$domain"*"-key.pem" ]]; then
+                    mv "$file" "$domain-key.pem"
+                    echo "✅ Renamed key file: $file → $domain-key.pem"
+                elif [[ "$file" == "$domain"*".pem" && "$file" != *"-key.pem" ]]; then
+                    mv "$file" "$domain.pem"
+                    echo "✅ Renamed cert file: $file → $domain.pem"
+                fi
+            done
+            
+            if [ -f "$domain.pem" ] && [ -f "$domain-key.pem" ]; then
+                echo "✅ SSL certificate generated (fallback method)"
+                return 0
+            fi
+        fi
+        
+        echo "❌ All SSL certificate generation methods failed"
+        return 1
+    fi
+}
+
+# Function to verify SSL certificate files
+verify_ssl_cert() {
+    local domain=$1
+    local cert_file="$CERT_ROOT/$domain.pem"
+    local key_file="$CERT_ROOT/$domain-key.pem"
+    
+    if [ ! -f "$cert_file" ]; then
+        echo "❌ Certificate file not found: $cert_file"
+        return 1
+    fi
+    
+    if [ ! -f "$key_file" ]; then
+        echo "❌ Key file not found: $key_file"
+        return 1
+    fi
+    
+    # Verify certificate
+    if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
+        echo "❌ Invalid certificate file: $cert_file"
+        return 1
+    fi
+    
+    # Verify key
+    if ! openssl rsa -in "$key_file" -check -noout 2>/dev/null; then
+        echo "❌ Invalid key file: $key_file"
+        return 1
+    fi
+    
+    # Verify certificate chain
+    local root_ca="$HOME/.local/share/mkcert/rootCA.pem"
+    if [ -f "$root_ca" ]; then
+        if openssl verify -CAfile "$root_ca" "$cert_file" > /dev/null 2>&1; then
+            echo "✅ SSL certificate verified and trusted: $domain"
+        else
+            echo "⚠️  SSL certificate valid but not trusted by local CA"
+        fi
+    else
+        echo "✅ SSL certificate verified: $domain"
+    fi
+    
+    return 0
+}
+
+# Function to fix certificate naming
+fix_certificate_naming() {
+    local domain=$1
+    
+    if [ -z "$domain" ]; then
+        echo "Usage: fix_certificate_naming <domain>"
+        echo "Example: fix_certificate_naming pmb.test"
+        return 1
+    fi
+    
+    cd "$CERT_ROOT"
+    
+    echo "🔧 Fixing certificate naming for: $domain"
+    
+    # Cari file certificate dengan pattern +number atau lainnya
+    local cert_file=$(find . -maxdepth 1 -name "${domain}*.pem" ! -name "*-key.pem" | head -1)
+    local key_file=$(find . -maxdepth 1 -name "${domain}*-key.pem" | head -1)
+    
+    if [ -n "$cert_file" ] && [ -n "$key_file" ]; then
+        # Remove ./ prefix jika ada
+        cert_file=$(basename "$cert_file")
+        key_file=$(basename "$key_file")
+        
+        if [ "$cert_file" != "$domain.pem" ]; then
+            mv "$cert_file" "$domain.pem"
+            echo "✅ Renamed: $cert_file → $domain.pem"
+        fi
+        
+        if [ "$key_file" != "$domain-key.pem" ]; then
+            mv "$key_file" "$domain-key.pem"
+            echo "✅ Renamed: $key_file → $domain-key.pem"
+        fi
+        
+        # Verify hasil
+        if verify_ssl_cert "$domain"; then
+            echo "🎉 Certificate naming fixed and verified"
+            return 0
+        else
+            echo "❌ Certificate verification failed after renaming"
+            return 1
+        fi
+    else
+        echo "❌ No certificate files found for: $domain"
+        echo "   Available files:"
+        ls -la *.pem 2>/dev/null || echo "   No .pem files found"
         return 1
     fi
 }
@@ -402,15 +513,23 @@ setup_nginx_config() {
     local ssl_cert=""
     local ssl_key=""
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+        echo "🔐 Setting up SSL for: $domain"
+        
         if generate_ssl_cert "$domain"; then
             ssl_cert="$CERT_ROOT/$domain.pem"
             ssl_key="$CERT_ROOT/$domain-key.pem"
-            echo "🔐 SSL enabled for: $domain"
             
-            # Verify certificate files exist
-            if [ ! -f "$ssl_cert" ] || [ ! -f "$ssl_key" ]; then
-                echo "❌ SSL certificate files not found, disabling SSL"
-                enable_ssl="false"
+            # Verify certificate files
+            if verify_ssl_cert "$domain"; then
+                echo "✅ SSL certificate ready"
+            else
+                echo "❌ SSL certificate verification failed, trying to fix..."
+                if fix_certificate_naming "$domain"; then
+                    echo "✅ SSL certificate fixed"
+                else
+                    echo "⚠️  SSL setup failed, continuing without SSL"
+                    enable_ssl="false"
+                fi
             fi
         else
             echo "⚠️  SSL certificate generation failed, continuing without SSL"
@@ -419,8 +538,8 @@ setup_nginx_config() {
     fi
     
     # Create nginx config dengan atau tanpa SSL
-    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
-        # Config dengan SSL - FIXED http2 directive
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
+        # Config dengan SSL - BETTER SSL SETTINGS
         sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
 # HTTP to HTTPS redirect
 server {
@@ -434,32 +553,30 @@ server {
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    http2 on;
     server_name $domain www.$domain;
     
     # SSL certificates
     ssl_certificate $ssl_cert;
     ssl_certificate_key $ssl_key;
     
-    # SSL configuration
+    # Better SSL settings
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    ssl_session_timeout 1d;
+    
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
     
     root $nginx_root_path;
     index index.php index.html index.htm;
 
     access_log /var/log/nginx/projects/${domain}-access.log;
     error_log /var/log/nginx/projects/${domain}-error.log;
-
-    # Security headers
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
-    add_header X-Frame-Options "SAMEORIGIN";
-    add_header X-Content-Type-Options "nosniff";
-    add_header X-XSS-Protection "1; mode=block";
-    add_header Referrer-Policy "strict-origin-when-cross-origin";
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -476,6 +593,7 @@ server {
     }
 }
 EOF
+        echo "🔐 SSL configuration applied"
     else
         # Config tanpa SSL (HTTP only)
         sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
@@ -510,6 +628,7 @@ server {
     }
 }
 EOF
+        echo "🌐 HTTP-only configuration applied"
     fi
     
     # Enable site
@@ -522,6 +641,25 @@ EOF
     if sudo nginx -t; then
         sudo service nginx reload
         echo "✅ Nginx configuration reloaded"
+        
+        # Test SSL jika enabled
+        if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+            echo "🔍 Testing HTTPS connection..."
+            sleep 2
+            if curl -k -s -o /dev/null -w "%{http_code}" "https://$domain" | grep -q "200\|301\|302"; then
+                echo "✅ HTTPS test successful"
+                
+                # Test certificate validity
+                echo "🔐 Testing certificate trust..."
+                if openssl s_client -connect "$domain:443" -servername "$domain" < /dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+                    echo "✅ Certificate is trusted by system"
+                else
+                    echo "⚠️  Certificate not trusted by system (install rootCA.crt)"
+                fi
+            else
+                echo "⚠️  HTTPS test failed, but configuration is valid"
+            fi
+        fi
     else
         echo "❌ Nginx configuration test failed"
         echo "💡 Checking for common issues..."
@@ -544,14 +682,13 @@ EOF
             echo "🔐 Checking SSL certificates..."
             if [ ! -f "$ssl_cert" ]; then
                 echo "❌ SSL certificate not found: $ssl_cert"
-                echo "💡 Regenerating SSL certificate..."
-                generate_ssl_cert "$domain"
             fi
             if [ ! -f "$ssl_key" ]; then
                 echo "❌ SSL key not found: $ssl_key"
             fi
         fi
         
+        echo "💡 Try running: project fix-cert $domain"
         return 1
     fi
     
@@ -559,9 +696,10 @@ EOF
     echo "📁 Local Path: $PROJECTS_ROOT/$project_type/$project_name"
     echo "🌐 Nginx Path: $nginx_root_path"
     echo "🔗 PHP: $php_version via $php_connection"
-    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
-        echo "🔐 SSL: ENABLED (https://$domain)"
-        echo "🔗 URL: https://$domain"
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
+        echo "🔐 SSL: ENABLED"
+        echo "🔗 URLs: http://$domain → https://$domain"
+        echo "💡 Remember to install rootCA.crt to avoid browser warnings"
     else
         echo "🔐 SSL: DISABLED"
         echo "🔗 URL: http://$domain"
@@ -711,12 +849,28 @@ list_projects() {
     echo ""
     echo "🔐 SSL Certificates:"
     if [ -d "$CERT_ROOT" ]; then
+        local cert_count=0
         find "$CERT_ROOT" -name "*.pem" -not -name "*-key.pem" | while read cert; do
             local domain_name=$(basename "$cert" .pem)
-            echo "   ✅ $domain_name"
+            local key_file="$CERT_ROOT/$domain_name-key.pem"
+            if [ -f "$key_file" ]; then
+                # Check if trusted
+                local root_ca="$HOME/.local/share/mkcert/rootCA.pem"
+                if [ -f "$root_ca" ] && openssl verify -CAfile "$root_ca" "$cert" > /dev/null 2>&1; then
+                    echo "   ✅ $domain_name (trusted)"
+                else
+                    echo "   ⚠️  $domain_name (install rootCA.crt)"
+                fi
+                cert_count=$((cert_count + 1))
+            else
+                echo "   ❌ $domain_name (missing key)"
+            fi
         done
+        if [ "$cert_count" -eq 0 ]; then
+            echo "   No valid SSL certificate pairs found"
+        fi
     else
-        echo "   No SSL certificates found"
+        echo "   No certificates directory found"
     fi
 }
 
@@ -824,6 +978,68 @@ fix_ntfs_permissions() {
     echo "💡 Using TCP connection to PHP-FPM on 127.0.0.1:9000"
 }
 
+# Function to check SSL status for domain
+check_ssl_status() {
+    local domain=$1
+    
+    if [ -z "$domain" ]; then
+        echo "Usage: check_ssl_status <domain>"
+        echo "Example: check_ssl_status pmb.test"
+        return 1
+    fi
+    
+    echo "🔍 SSL Status for: $domain"
+    echo "========================"
+    
+    # Check certificate files
+    local cert_file="$CERT_ROOT/$domain.pem"
+    local key_file="$CERT_ROOT/$domain-key.pem"
+    
+    if [ -f "$cert_file" ]; then
+        echo "✅ Certificate: $cert_file"
+        echo "   Issued To: $(openssl x509 -in "$cert_file" -subject -noout 2>/dev/null | sed 's/subject=//')"
+        echo "   Expires: $(openssl x509 -in "$cert_file" -enddate -noout 2>/dev/null | sed 's/notAfter=//')"
+    else
+        echo "❌ Certificate: NOT FOUND"
+    fi
+    
+    if [ -f "$key_file" ]; then
+        echo "✅ Key: $key_file"
+    else
+        echo "❌ Key: NOT FOUND"
+    fi
+    
+    # Check nginx config
+    local nginx_config="$NGINX_AVAILABLE/$domain"
+    if [ -f "$nginx_config" ]; then
+        if grep -q "listen 443 ssl" "$nginx_config"; then
+            echo "✅ Nginx: SSL ENABLED"
+        else
+            echo "❌ Nginx: SSL DISABLED"
+        fi
+    else
+        echo "❌ Nginx: CONFIG NOT FOUND"
+    fi
+    
+    # Test HTTPS connection
+    echo ""
+    echo "🔗 Testing HTTPS connection..."
+    if curl -k -s -o /dev/null -w "HTTP Status: %{http_code}\n" "https://$domain"; then
+        echo "✅ HTTPS: CONNECTION SUCCESSFUL"
+    else
+        echo "❌ HTTPS: CONNECTION FAILED"
+    fi
+    
+    # Check certificate trust
+    echo ""
+    echo "🔐 Certificate Trust:"
+    if openssl s_client -connect "$domain:443" -servername "$domain" < /dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+        echo "✅ Trusted by system"
+    else
+        echo "❌ NOT trusted - Install rootCA.crt to fix"
+    fi
+}
+
 # Main function dispatcher
 project_manager() {
     case $1 in
@@ -841,6 +1057,15 @@ project_manager() {
             ;;
         "mkcert-setup")
             setup_mkcert
+            ;;
+        "trust-setup")
+            setup_browser_trust
+            ;;
+        "fix-cert")
+            fix_certificate_naming $2
+            ;;
+        "ssl-status")
+            check_ssl_status $2
             ;;
         "list")
             list_projects
@@ -881,13 +1106,13 @@ project_manager() {
             echo "   - CodeIgniter3: /var/www/projects/codeigniter3/{project}"
             ;;
         *)
-            echo "🏗️  Project Manager v2.0 - WITH SSL SUPPORT"
+            echo "🏗️  Project Manager v2.2 - WITH TRUSTED SSL"
             echo "=========================================="
             echo "📁 Project Location: $PROJECTS_ROOT/<type>/<project>"
             echo "📁 Scripts Location: $SCRIPTS_ROOT"
             echo "🔗 Symlink: /var/www/projects -> $PROJECTS_ROOT"
             echo "🔗 PHP-FPM: Auto-detected"
-            echo "🔐 SSL: mkcert support"
+            echo "🔐 SSL: Trusted certificates with browser support"
             echo ""
             echo "Commands:"
             echo "  create <type> <name> <domain> [force] [ssl] - Create new project"
@@ -895,6 +1120,9 @@ project_manager() {
             echo "  enable-ssl <type> <name> [domain]          - Enable SSL for project"
             echo "  disable-ssl <type> <name> [domain]         - Disable SSL for project"
             echo "  mkcert-setup                               - Setup mkcert environment"
+            echo "  trust-setup                                - Setup browser trust for certificates"
+            echo "  fix-cert <domain>                          - Fix certificate naming"
+            echo "  ssl-status <domain>                        - Check SSL status"
             echo "  list                                       - List all projects with status"
             echo "  code <type> <name>                         - Open project in VS Code"
             echo "  delete <type> <name> [remove-files]        - Remove nginx config (and files)"
@@ -909,12 +1137,10 @@ project_manager() {
             echo "Project Types: laravel, nextjs, codeigniter3"
             echo ""
             echo "Examples:"
-            echo "  project create laravel myapp myapp.test"
-            echo "  project create laravel myapp myapp.test force ssl"
-            echo "  project setup codeigniter3 pmb pmb.test ssl"
-            echo "  project enable-ssl laravel myapp"
-            echo "  project mkcert-setup"
-            echo "  project php-info"
+            echo "  project create laravel myapp myapp.test ssl"
+            echo "  project trust-setup                        # Fix browser warnings"
+            echo "  project enable-ssl codeigniter3 pmb"
+            echo "  project ssl-status pmb.test"
             echo "  project list"
             ;;
     esac
@@ -927,6 +1153,9 @@ alias pj-setup="project_manager setup"
 alias pj-enable-ssl="project_manager enable-ssl"
 alias pj-disable-ssl="project_manager disable-ssl"
 alias pj-mkcert="project_manager mkcert-setup"
+alias pj-trust="project_manager trust-setup"
+alias pj-fix-cert="project_manager fix-cert"
+alias pj-ssl-status="project_manager ssl-status"
 alias pj-list="project_manager list"
 alias pj-code="project_manager code"
 alias pj-delete="project_manager delete"
