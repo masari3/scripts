@@ -1,11 +1,89 @@
 #!/bin/bash
 
 # UPDATED PATHS - SESUAI DENGAN FIX YANG BEKERJA
-PROJECTS_ROOT="/mnt/d/projects/www"  # ← PATH YANG BENAR
+PROJECTS_ROOT="/mnt/d/projects/www"
 SCRIPTS_ROOT="/mnt/d/projects/scripts"
 NGINX_AVAILABLE="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
 HOSTS_FILE="/mnt/c/Windows/System32/drivers/etc/hosts"
+CERT_ROOT="/mnt/d/projects/certs"
+
+# Function to setup mkcert environment
+setup_mkcert() {
+    echo "🔐 Setting up mkcert for SSL certificates..."
+    
+    # Install mkcert jika belum ada
+    if ! command -v mkcert &> /dev/null; then
+        echo "📦 Installing mkcert..."
+        sudo apt update
+        sudo apt install libnss3-tools -y
+        wget -O mkcert https://github.com/FiloSottile/mkcert/releases/latest/download/mkcert-v1.4.4-linux-amd64
+        chmod +x mkcert
+        sudo mv mkcert /usr/local/bin/
+    fi
+    
+    # Setup local CA jika belum ada
+    if [ ! -f "$HOME/.local/share/mkcert/rootCA.pem" ]; then
+        echo "📝 Creating local Certificate Authority..."
+        mkcert -install
+    fi
+    
+    # Create certs directory jika belum ada
+    mkdir -p "$CERT_ROOT"
+    
+    echo "✅ mkcert setup completed"
+}
+
+# Function to generate SSL certificate for domain
+generate_ssl_cert() {
+    local domain=$1
+    
+    if [ -z "$domain" ]; then
+        echo "❌ Domain is required for SSL certificate"
+        return 1
+    fi
+    
+    echo "🔐 Generating SSL certificate for: $domain"
+    
+    # Setup mkcert jika belum
+    setup_mkcert
+    
+    # Pastikan certs directory ada
+    mkdir -p "$CERT_ROOT"
+    
+    # Generate certificate di certs directory
+    cd "$CERT_ROOT"
+    
+    # Hapus certificate lama jika ada (termasuk yang +1, +2, dll)
+    rm -f "$domain"*.pem
+    rm -f "$domain"-key*.pem
+    
+    # Generate certificate dengan nama yang konsisten
+    if mkcert "$domain" "www.$domain" "localhost.$domain"; then
+        # Cari file certificate yang baru dibuat (bisa dengan +number)
+        local cert_file=$(ls -1 | grep -E "^${domain}(\+[0-9]+)?\.pem$" | head -1)
+        local key_file=$(ls -1 | grep -E "^${domain}(\+[0-9]+)?-key\.pem$" | head -1)
+        
+        if [ -n "$cert_file" ] && [ -n "$key_file" ]; then
+            # Rename file ke nama yang konsisten
+            mv "$cert_file" "$domain.pem"
+            mv "$key_file" "$domain-key.pem"
+            
+            echo "✅ SSL certificate generated:"
+            echo "   Cert: $CERT_ROOT/$domain.pem"
+            echo "   Key:  $CERT_ROOT/$domain-key.pem"
+            return 0
+        else
+            echo "❌ Certificate files not found after generation"
+            echo "   Available files:"
+            ls -la *.pem 2>/dev/null || echo "   No .pem files found"
+            return 1
+        fi
+    else
+        echo "❌ Failed to generate SSL certificate"
+        return 1
+    fi
+}
 
 # Function to detect PHP version
 detect_php_version() {
@@ -133,11 +211,12 @@ create_project() {
     local project_name=$2
     local domain=$3
     local force_recreate=${4:-false}
+    local enable_ssl=${5:-false}
     
     if [ -z "$project_type" ] || [ -z "$project_name" ] || [ -z "$domain" ]; then
-        echo "Usage: create_project <laravel|nextjs|codeigniter3> <project-name> <domain> [force]"
+        echo "Usage: create_project <laravel|nextjs|codeigniter3> <project-name> <domain> [force] [ssl]"
         echo "Example: create_project laravel myapp myapp.test"
-        echo "Example: create_project laravel myapp myapp.test force (recreate config)"
+        echo "Example: create_project laravel myapp myapp.test force ssl"
         return 1
     fi
     
@@ -154,7 +233,7 @@ create_project() {
             echo "   Example: create_project $project_type $project_name $domain force"
             
             # Just setup nginx config without creating directories
-            setup_nginx_config "$project_type" "$project_name" "$domain"
+            setup_nginx_config "$project_type" "$project_name" "$domain" "$enable_ssl"
             return 0
         fi
     fi
@@ -171,7 +250,7 @@ create_project() {
     fi
     
     # Setup nginx configuration
-    setup_nginx_config "$project_type" "$project_name" "$domain"
+    setup_nginx_config "$project_type" "$project_name" "$domain" "$enable_ssl"
 }
 
 # Function to create framework-specific structure
@@ -199,11 +278,12 @@ create_project_structure() {
     esac
 }
 
-# Function to setup nginx configuration with CORRECT PATHS
+# Function to setup nginx configuration with SSL support
 setup_nginx_config() {
     local project_type=$1
     local project_name=$2
     local domain=$3
+    local enable_ssl=${4:-false}
     
     # Check if domain already configured
     if domain_exists "$domain"; then
@@ -240,14 +320,93 @@ setup_nginx_config() {
     
     echo "📁 Nginx root path: $nginx_root_path"
     
-    # Create nginx config dengan path yang benar dan PHP connection yang terdeteksi
-    sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+    # Generate SSL certificate jika enable_ssl
+    local ssl_cert=""
+    local ssl_key=""
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+        if generate_ssl_cert "$domain"; then
+            ssl_cert="$CERT_ROOT/$domain.pem"
+            ssl_key="$CERT_ROOT/$domain-key.pem"
+            echo "🔐 SSL enabled for: $domain"
+            
+            # Verify certificate files exist
+            if [ ! -f "$ssl_cert" ] || [ ! -f "$ssl_key" ]; then
+                echo "❌ SSL certificate files not found, disabling SSL"
+                enable_ssl="false"
+            fi
+        else
+            echo "⚠️  SSL certificate generation failed, continuing without SSL"
+            enable_ssl="false"
+        fi
+    fi
+    
+    # Create nginx config dengan atau tanpa SSL
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+        # Config dengan SSL - FIXED http2 directive
+        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# HTTP to HTTPS redirect
 server {
     listen 80;
     listen [::]:80;
-    server_name $domain;
+    server_name $domain www.$domain;
+    return 301 https://\$server_name\$request_uri;
+}
+
+# HTTPS server
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name $domain www.$domain;
     
-    # PREVENT HTTPS REDIRECT
+    # SSL certificates
+    ssl_certificate $ssl_cert;
+    ssl_certificate_key $ssl_key;
+    
+    # SSL configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    root $nginx_root_path;
+    index index.php index.html index.htm;
+
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header X-XSS-Protection "1; mode=block";
+    add_header Referrer-Policy "strict-origin-when-cross-origin";
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        include fastcgi_params;
+        fastcgi_pass $php_connection;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+    else
+        # Config tanpa SSL (HTTP only)
+        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    
+    # Prevent HTTPS redirect for local development
     if (\$scheme = https) {
         return 301 http://\$server_name\$request_uri;
     }
@@ -273,6 +432,7 @@ server {
     }
 }
 EOF
+    fi
     
     # Enable site
     sudo ln -sf "$NGINX_AVAILABLE/$domain" "$NGINX_ENABLED/$domain"
@@ -301,6 +461,19 @@ EOF
             setup_symlink
         fi
         
+        # Check SSL certificates if SSL was enabled
+        if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+            echo "🔐 Checking SSL certificates..."
+            if [ ! -f "$ssl_cert" ]; then
+                echo "❌ SSL certificate not found: $ssl_cert"
+                echo "💡 Regenerating SSL certificate..."
+                generate_ssl_cert "$domain"
+            fi
+            if [ ! -f "$ssl_key" ]; then
+                echo "❌ SSL key not found: $ssl_key"
+            fi
+        fi
+        
         return 1
     fi
     
@@ -308,7 +481,13 @@ EOF
     echo "📁 Local Path: $PROJECTS_ROOT/$project_type/$project_name"
     echo "🌐 Nginx Path: $nginx_root_path"
     echo "🔗 PHP: $php_version via $php_connection"
-    echo "🔗 URL: http://$domain"
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+        echo "🔐 SSL: ENABLED (https://$domain)"
+        echo "🔗 URL: https://$domain"
+    else
+        echo "🔐 SSL: DISABLED"
+        echo "🔗 URL: http://$domain"
+    fi
 }
 
 # Function to add domain to Windows hosts (IMPROVED)
@@ -340,10 +519,12 @@ setup_existing_project() {
     local project_type=$1
     local project_name=$2
     local domain=$3
+    local enable_ssl=${4:-false}
     
     if [ -z "$project_type" ] || [ -z "$project_name" ] || [ -z "$domain" ]; then
-        echo "Usage: setup_existing <laravel|nextjs|codeigniter3> <project-name> <domain>"
+        echo "Usage: setup_existing <laravel|nextjs|codeigniter3> <project-name> <domain> [ssl]"
         echo "Example: setup_existing laravel myapp myapp.test"
+        echo "Example: setup_existing laravel myapp myapp.test ssl"
         return 1
     fi
     
@@ -354,7 +535,49 @@ setup_existing_project() {
     fi
     
     echo "🔧 Setting up nginx configuration for existing project: $project_name"
-    setup_nginx_config "$project_type" "$project_name" "$domain"
+    setup_nginx_config "$project_type" "$project_name" "$domain" "$enable_ssl"
+}
+
+# Function to enable SSL for existing project
+enable_ssl() {
+    local project_type=$1
+    local project_name=$2
+    local domain=${3:-"${project_name}.test"}
+    
+    if [ -z "$project_type" ] || [ -z "$project_name" ]; then
+        echo "Usage: enable_ssl <laravel|nextjs|codeigniter3> <project-name> [domain]"
+        echo "Example: enable_ssl laravel myapp myapp.test"
+        return 1
+    fi
+    
+    if ! project_exists "$project_type" "$project_name"; then
+        echo "❌ Project not found: $PROJECTS_ROOT/$project_type/$project_name"
+        return 1
+    fi
+    
+    echo "🔐 Enabling SSL for: $domain"
+    setup_nginx_config "$project_type" "$project_name" "$domain" "true"
+}
+
+# Function to disable SSL for existing project
+disable_ssl() {
+    local project_type=$1
+    local project_name=$2
+    local domain=${3:-"${project_name}.test"}
+    
+    if [ -z "$project_type" ] || [ -z "$project_name" ]; then
+        echo "Usage: disable_ssl <laravel|nextjs|codeigniter3> <project-name> [domain]"
+        echo "Example: disable_ssl laravel myapp myapp.test"
+        return 1
+    fi
+    
+    if ! project_exists "$project_type" "$project_name"; then
+        echo "❌ Project not found: $PROJECTS_ROOT/$project_type/$project_name"
+        return 1
+    fi
+    
+    echo "🔓 Disabling SSL for: $domain"
+    setup_nginx_config "$project_type" "$project_name" "$domain" "false"
 }
 
 # Function to list all projects with status
@@ -375,8 +598,14 @@ list_projects() {
             find "$PROJECTS_ROOT/$project_type" -maxdepth 1 -type d | tail -n +2 | while read dir; do
                 local name=$(basename "$dir")
                 local domain="${name}.test"
-                if domain_exists "$domain"; then
-                    echo "   ✅ $name (http://$domain)"
+                local nginx_config="$NGINX_AVAILABLE/$domain"
+                
+                if [ -f "$nginx_config" ]; then
+                    if grep -q "listen 443 ssl" "$nginx_config"; then
+                        echo "   🔐 $name (https://$domain)"
+                    else
+                        echo "   🌐 $name (http://$domain)"
+                    fi
                 else
                     echo "   ❌ $name (no nginx config)"
                 fi
@@ -398,6 +627,18 @@ list_projects() {
         echo "   ✅ /var/www/projects -> $(readlink /var/www/projects)"
     else
         echo "   ❌ /var/www/projects symlink not found"
+    fi
+    
+    # Show SSL status
+    echo ""
+    echo "🔐 SSL Certificates:"
+    if [ -d "$CERT_ROOT" ]; then
+        find "$CERT_ROOT" -name "*.pem" -not -name "*-key.pem" | while read cert; do
+            local domain_name=$(basename "$cert" .pem)
+            echo "   ✅ $domain_name"
+        done
+    else
+        echo "   No SSL certificates found"
     fi
 }
 
@@ -450,6 +691,13 @@ delete_project() {
         echo "ℹ️  No nginx config found for: $domain"
     fi
     
+    # Remove SSL certificates
+    if [ -f "$CERT_ROOT/$domain.pem" ]; then
+        rm -f "$CERT_ROOT/$domain.pem"
+        rm -f "$CERT_ROOT/$domain-key.pem"
+        echo "✅ Removed SSL certificates for: $domain"
+    fi
+    
     # Remove project files if requested
     if [ "$remove_files" = "remove-files" ] && [ -d "$project_path" ]; then
         rm -rf "$project_path"
@@ -478,7 +726,7 @@ fix_project() {
     fi
     
     echo "🔧 Fixing project: $project_name"
-    setup_nginx_config "$project_type" "$project_name" "$domain"
+    setup_nginx_config "$project_type" "$project_name" "$domain" "false"
 }
 
 # Function to fix permissions for NTFS
@@ -502,10 +750,19 @@ fix_ntfs_permissions() {
 project_manager() {
     case $1 in
         "create")
-            create_project $2 $3 $4 $5
+            create_project $2 $3 $4 $5 $6
             ;;
         "setup")
-            setup_existing_project $2 $3 $4
+            setup_existing_project $2 $3 $4 $5
+            ;;
+        "enable-ssl")
+            enable_ssl $2 $3 $4
+            ;;
+        "disable-ssl")
+            disable_ssl $2 $3 $4
+            ;;
+        "mkcert-setup")
+            setup_mkcert
             ;;
         "list")
             list_projects
@@ -539,41 +796,47 @@ project_manager() {
             echo "📁 Scripts Root: $SCRIPTS_ROOT"
             echo "🔗 Nginx Root: /var/www/projects -> $(readlink /var/www/projects 2>/dev/null || echo 'Not set')"
             echo "🔗 PHP-FPM: $(get_php_fpm_connection)"
+            echo "🔐 Certificates: $CERT_ROOT"
             echo "📁 Nginx Paths:"
             echo "   - Laravel: /var/www/projects/laravel/{project}/public"
             echo "   - NextJS: /var/www/projects/nextjs/{project}"
             echo "   - CodeIgniter3: /var/www/projects/codeigniter3/{project}"
             ;;
         *)
-            echo "🏗️  Project Manager - FIXED SETUP"
-            echo "================================"
+            echo "🏗️  Project Manager v2.0 - WITH SSL SUPPORT"
+            echo "=========================================="
             echo "📁 Project Location: $PROJECTS_ROOT/<type>/<project>"
             echo "📁 Scripts Location: $SCRIPTS_ROOT"
             echo "🔗 Symlink: /var/www/projects -> $PROJECTS_ROOT"
             echo "🔗 PHP-FPM: Auto-detected"
+            echo "🔐 SSL: mkcert support"
             echo ""
             echo "Commands:"
-            echo "  create <type> <name> <domain> [force]    - Create new project"
-            echo "  setup <type> <name> <domain>            - Setup nginx for existing project"
-            echo "  list                                    - List all projects with status"
-            echo "  code <type> <name>                      - Open project in VS Code"
-            echo "  delete <type> <name> [remove-files]     - Remove nginx config (and files)"
-            echo "  fix <type> <name> [domain]              - Recreate nginx config"
-            echo "  symlink                                 - Setup correct symlink"
-            echo "  permissions <type> <name>               - NTFS permission info"
-            echo "  hosts <domain>                          - Add domain to hosts"
-            echo "  exists <type> <name>                    - Check if project exists"
-            echo "  php-info                                - Show PHP version info"
-            echo "  path                                    - Show all paths"
+            echo "  create <type> <name> <domain> [force] [ssl] - Create new project"
+            echo "  setup <type> <name> <domain> [ssl]         - Setup nginx for existing project"
+            echo "  enable-ssl <type> <name> [domain]          - Enable SSL for project"
+            echo "  disable-ssl <type> <name> [domain]         - Disable SSL for project"
+            echo "  mkcert-setup                               - Setup mkcert environment"
+            echo "  list                                       - List all projects with status"
+            echo "  code <type> <name>                         - Open project in VS Code"
+            echo "  delete <type> <name> [remove-files]        - Remove nginx config (and files)"
+            echo "  fix <type> <name> [domain]                 - Recreate nginx config"
+            echo "  symlink                                    - Setup correct symlink"
+            echo "  permissions <type> <name>                  - NTFS permission info"
+            echo "  hosts <domain>                             - Add domain to hosts"
+            echo "  exists <type> <name>                       - Check if project exists"
+            echo "  php-info                                   - Show PHP version info"
+            echo "  path                                       - Show all paths"
             echo ""
             echo "Project Types: laravel, nextjs, codeigniter3"
             echo ""
             echo "Examples:"
             echo "  project create laravel myapp myapp.test"
-            echo "  project setup codeigniter3 pmb pmb.test"
-            echo "  project php-info                        # Check PHP version"
-            echo "  project symlink"
-            echo "  project path"
+            echo "  project create laravel myapp myapp.test force ssl"
+            echo "  project setup codeigniter3 pmb pmb.test ssl"
+            echo "  project enable-ssl laravel myapp"
+            echo "  project mkcert-setup"
+            echo "  project php-info"
             echo "  project list"
             ;;
     esac
@@ -583,6 +846,9 @@ project_manager() {
 alias project="project_manager"
 alias pj-create="project_manager create"
 alias pj-setup="project_manager setup"
+alias pj-enable-ssl="project_manager enable-ssl"
+alias pj-disable-ssl="project_manager disable-ssl"
+alias pj-mkcert="project_manager mkcert-setup"
 alias pj-list="project_manager list"
 alias pj-code="project_manager code"
 alias pj-delete="project_manager delete"
