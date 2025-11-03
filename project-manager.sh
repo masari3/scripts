@@ -245,10 +245,13 @@ setup_nginx_config() {
 server {
     listen 80;
     listen [::]:80;
-    
     server_name $domain;
     
-    # CORRECT PATH FOR STRUCTURED FOLDERS
+    # PREVENT HTTPS REDIRECT
+    if (\$scheme = https) {
+        return 301 http://\$server_name\$request_uri;
+    }
+    
     root $nginx_root_path;
     index index.php index.html index.htm;
 
