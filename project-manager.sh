@@ -34,6 +34,84 @@ setup_mkcert() {
     echo "✅ mkcert setup completed"
 }
 
+# Function to setup browser trust for mkcert
+setup_browser_trust() {
+    echo "🔐 Setting up browser trust for mkcert..."
+    
+    # Setup mkcert jika belum
+    setup_mkcert
+    
+    # Pastikan certs directory ada
+    mkdir -p "$CERT_ROOT"
+    
+    # Export root CA
+    local root_ca_path="$HOME/.local/share/mkcert/rootCA.pem"
+    
+    if [ ! -f "$root_ca_path" ]; then
+        echo "❌ mkcert root CA not found"
+        return 1
+    fi
+    
+    # Copy root CA to certs directory
+    cp "$root_ca_path" "$CERT_ROOT/rootCA.pem"
+    
+    # Convert to .crt format untuk Windows
+    openssl x509 -outform der -in "$root_ca_path" -out "$CERT_ROOT/rootCA.crt" 2>/dev/null
+    
+    echo "✅ Root CA exported:"
+    echo "   PEM: $CERT_ROOT/rootCA.pem"
+    echo "   CRT: $CERT_ROOT/rootCA.crt"
+    echo ""
+    echo "📝 INSTRUCTIONS TO TRUST CERTIFICATE:"
+    echo "====================================="
+    echo "1. Open File Explorer and go to: D:\\projects\\certs\\"
+    echo "2. Double-click 'rootCA.crt'"
+    echo "3. Click 'Install Certificate'"
+    echo "4. Choose 'Current User' or 'Local Machine'"
+    echo "5. Select 'Place all certificates in the following store'"
+    echo "6. Click 'Browse' and select 'Trusted Root Certification Authorities'"
+    echo "7. Click 'OK' and 'Finish'"
+    echo "8. RESTART YOUR BROWSER"
+    echo ""
+    echo "🔍 After installation, SSL warnings should disappear!"
+    
+    # Create PowerShell script untuk auto-install
+    cat > "$CERT_ROOT/trust-certificate.ps1" << 'EOF'
+# trust-certificate.ps1 - Run as Administrator
+param([switch]$CurrentUser = $true)
+
+$CertPath = "D:\projects\certs\rootCA.crt"
+
+if (-not (Test-Path $CertPath)) {
+    Write-Host "❌ Certificate file not found: $CertPath" -ForegroundColor Red
+    exit 1
+}
+
+try {
+    $Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($CertPath)
+    
+    if ($CurrentUser) {
+        $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "CurrentUser")
+    } else {
+        $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
+    }
+    
+    $Store.Open("ReadWrite")
+    $Store.Add($Cert)
+    $Store.Close()
+    
+    Write-Host "✅ Certificate installed to Trusted Root Certification Authorities" -ForegroundColor Green
+    Write-Host "💡 Please restart your browser" -ForegroundColor Yellow
+} catch {
+    Write-Host "❌ Failed to install certificate: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "💡 Try running PowerShell as Administrator" -ForegroundColor Yellow
+}
+EOF
+
+    echo "📁 PowerShell script created: $CERT_ROOT/trust-certificate.ps1"
+    echo "💡 Run in PowerShell Admin: .\trust-certificate.ps1"
+}
+
 # Function to generate SSL certificate for domain
 generate_ssl_cert() {
     local domain=$1
