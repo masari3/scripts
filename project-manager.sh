@@ -192,6 +192,9 @@ setup_aliases() {
         "alias pj-fix-permissions='$script_path fix-permissions'"
         "alias pj-verify-access='$script_path verify-access'"
         "alias pj-fix-home-permission='$script_path fix-home-permission'"
+        "alias pj-troubleshoot='$script_path troubleshoot'"
+        "alias pj-network-status='$script_path network-status'"
+        "alias pj-restart-services='$script_path restart-services'"
         ""
     )
     
@@ -222,6 +225,9 @@ setup_aliases() {
     echo "  pj-fix-permissions   - Fix project permissions"
     echo "  pj-verify-access     - Verify project web accessibility"
     echo "  pj-fix-home-permission - Fix home directory permission"
+    echo "  pj-troubleshoot      - Troubleshoot connection issues"
+    echo "  pj-network-status    - Show network and service status"
+    echo "  pj-restart-services  - Restart web services"
     echo ""
     echo -e "${YELLOW}To use aliases immediately, run:${NC}"
     echo "  source $shell_config"
@@ -1239,6 +1245,179 @@ fix_home_permission() {
     echo -e "${ICON_SUCCESS} Home directory permissions fixed for web server access"
 }
 
+# Function to troubleshoot connection issues
+troubleshoot_connection() {
+    local domain=$1
+    
+    if [ -z "$domain" ]; then
+        domain="localhost"
+    fi
+    
+    echo -e "${ICON_GEAR} Troubleshooting connection to: $domain"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    # 1. Check Nginx status
+    echo -e "\n${ICON_INFO} 1. Checking Nginx status..."
+    if systemctl is-active --quiet nginx; then
+        echo -e "   ${ICON_CHECK} Nginx is RUNNING"
+    else
+        echo -e "   ${ICON_ERROR} Nginx is NOT RUNNING"
+        echo -e "   ${ICON_GEAR} Starting Nginx..."
+        sudo systemctl start nginx
+        sleep 2
+        if systemctl is-active --quiet nginx; then
+            echo -e "   ${ICON_CHECK} Nginx started successfully"
+        else
+            echo -e "   ${ICON_ERROR} Failed to start Nginx"
+            sudo systemctl status nginx --no-pager
+            return 1
+        fi
+    fi
+    
+    # 2. Check Nginx configuration
+    echo -e "\n${ICON_INFO} 2. Checking Nginx configuration..."
+    if sudo nginx -t; then
+        echo -e "   ${ICON_CHECK} Nginx configuration test passed"
+    else
+        echo -e "   ${ICON_ERROR} Nginx configuration test failed"
+        return 1
+    fi
+    
+    # 3. Check hosts file entry
+    echo -e "\n${ICON_INFO} 3. Checking hosts file..."
+    if grep -q "$domain" "$HOSTS_FILE"; then
+        echo -e "   ${ICON_CHECK} Domain found in hosts file"
+    else
+        echo -e "   ${ICON_ERROR} Domain NOT found in hosts file: $domain"
+        echo -e "   ${ICON_GEAR} Adding to hosts file..."
+        add_to_hosts "$domain"
+    fi
+    
+    # 4. Check if domain resolves
+    echo -e "\n${ICON_INFO} 4. Checking DNS resolution..."
+    if ping -c 1 -W 1 "$domain" &> /dev/null; then
+        echo -e "   ${ICON_CHECK} Domain resolves correctly: $domain"
+    else
+        echo -e "   ${ICON_WARN} Domain does not ping, but might be normal for local domains"
+    fi
+    
+    # 5. Test connection to localhost first
+    echo -e "\n${ICON_INFO} 5. Testing basic connectivity..."
+    if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1 | grep -q "200\|301\|302"; then
+        echo -e "   ${ICON_CHECK} Localhost connection successful"
+    else
+        echo -e "   ${ICON_ERROR} Cannot connect to localhost - Nginx issue"
+        return 1
+    fi
+    
+    # 6. Test specific domain
+    echo -e "\n${ICON_INFO} 6. Testing domain: $domain"
+    local response=$(curl -s -o /dev/null -w "%{http_code}" http://$domain)
+    if [ "$response" = "200" ] || [ "$response" = "301" ] || [ "$response" = "302" ]; then
+        echo -e "   ${ICON_CHECK} Domain connection successful: HTTP $response"
+    else
+        echo -e "   ${ICON_ERROR} Domain connection failed: HTTP $response"
+        echo -e "   ${ICON_INFO} Checking Nginx site configuration..."
+        
+        # Check if site config exists
+        if [ -f "/etc/nginx/sites-available/$domain" ]; then
+            echo -e "   ${ICON_CHECK} Site config exists: /etc/nginx/sites-available/$domain"
+            
+            # Check if enabled
+            if [ -L "/etc/nginx/sites-enabled/$domain" ]; then
+                echo -e "   ${ICON_CHECK} Site is enabled"
+            else
+                echo -e "   ${ICON_ERROR} Site is NOT enabled"
+                echo -e "   ${ICON_GEAR} Enabling site..."
+                sudo ln -sf "/etc/nginx/sites-available/$domain" "/etc/nginx/sites-enabled/$domain"
+                sudo systemctl reload nginx
+            fi
+        else
+            echo -e "   ${ICON_ERROR} Site config not found: /etc/nginx/sites-available/$domain"
+        fi
+    fi
+    
+    echo -e "\n${ICON_SUCCESS} Troubleshooting completed!"
+}
+
+# Function to show network status
+show_network_status() {
+    echo -e "${CYAN}${ICON_NETWORK} NETWORK STATUS${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    # Nginx status
+    echo -e "\n${ICON_SERVER} Nginx Status:"
+    if systemctl is-active --quiet nginx; then
+        echo -e "   ${ICON_CHECK} Running"
+        echo -e "   ${ICON_INFO} Active sites:"
+        sudo nginx -T 2>/dev/null | grep "server_name " | grep -v "_\|default" | sort | uniq | sed 's/^/     /'
+    else
+        echo -e "   ${ICON_ERROR} Stopped"
+    fi
+    
+    # PHP-FPM status
+    echo -e "\n${ICON_CODE} PHP-FPM Status:"
+    for version in 8.2 8.1 7.4; do
+        if systemctl is-active --quiet "php${version}-fpm"; then
+            echo -e "   ${ICON_CHECK} php${version}-fpm: Running"
+        else
+            echo -e "   ${ICON_WARN} php${version}-fpm: Stopped"
+        fi
+    done
+    
+    # Hosts entries
+    echo -e "\n${ICON_NETWORK} Hosts File Entries:"
+    grep -E "^(127.0.0.1|::1)" "$HOSTS_FILE" | grep -v "localhost" | head -10 | sed 's/^/     /'
+    if ! grep -q "127.0.0.1" "$HOSTS_FILE" | grep -v "localhost"; then
+        echo -e "   ${ICON_WARN} No custom domains found in hosts file"
+    fi
+}
+
+# Function to restart web services
+restart_services() {
+    echo -e "${ICON_GEAR} Restarting web services..."
+    
+    # Restart Nginx
+    echo -e "${ICON_INFO} Restarting Nginx..."
+    sudo systemctl restart nginx
+    if systemctl is-active --quiet nginx; then
+        echo -e "   ${ICON_CHECK} Nginx restarted successfully"
+    else
+        echo -e "   ${ICON_ERROR} Failed to restart Nginx"
+        sudo systemctl status nginx --no-pager
+        return 1
+    fi
+    
+    # Restart PHP-FPM services
+    echo -e "${ICON_INFO} Restarting PHP-FPM services..."
+    for version in 8.2 8.1 7.4; do
+        if systemctl is-active --quiet "php${version}-fpm"; then
+            sudo systemctl restart "php${version}-fpm"
+            if systemctl is-active --quiet "php${version}-fpm"; then
+                echo -e "   ${ICON_CHECK} PHP ${version} FPM restarted"
+            else
+                echo -e "   ${ICON_WARN} PHP ${version} FPM restart failed"
+            fi
+        fi
+    done
+    
+    # Restart MariaDB if running
+    if systemctl is-active --quiet mariadb; then
+        echo -e "${ICON_INFO} Restarting MariaDB..."
+        sudo systemctl restart mariadb
+        if systemctl is-active --quiet mariadb; then
+            echo -e "   ${ICON_CHECK} MariaDB restarted"
+        else
+            echo -e "   ${ICON_WARN} MariaDB restart failed"
+        fi
+    fi
+    
+    echo -e "${ICON_SUCCESS} All services restarted successfully!"
+    echo ""
+    echo -e "${CYAN}Current Service Status:${NC}"
+    show_network_status
+}
+
 # Function to show detailed help with aliases
 show_detailed_help() {
     show_header
@@ -1265,6 +1444,9 @@ show_detailed_help() {
     echo "  project fix-permissions"
     echo "  project verify-access"
     echo "  project fix-home-permission"
+    echo "  project troubleshoot [domain]"
+    echo "  project network-status"
+    echo "  project restart-services"
     echo ""
     echo -e "${YELLOW}QUICK ALIASES:${NC}"
     echo "  pj-create <type> <name> <domain> [ssl]"
@@ -1285,6 +1467,9 @@ show_detailed_help() {
     echo "  pj-fix-permissions"
     echo "  pj-verify-access"
     echo "  pj-fix-home-permission"
+    echo "  pj-troubleshoot [domain]"
+    echo "  pj-network-status"
+    echo "  pj-restart-services"
     echo ""
     echo -e "${BLUE}EXAMPLES:${NC}"
     echo "  pj-create laravel myapp myapp.test"
@@ -1293,17 +1478,40 @@ show_detailed_help() {
     echo "  pj-exists ci3 myapp"
     echo "  pj-fix laravel myapp"
     echo "  pj-enable-ssl ci3 myapp"
+    echo "  pj-troubleshoot myapp.test"
+    echo "  pj-network-status"
+    echo "  pj-restart-services"
     echo "  pj-list"
     echo "  pj-fix-home-permission"
     echo ""
     echo -e "${PURPLE}PROJECT TYPES:${NC}"
     echo "  laravel, nextjs, ci3 (codeigniter3)"
     echo ""
-    echo -e "${CYAN}PERMISSION FIXES:${NC}"
-    echo "  If you get 'Primary script unknown' errors:"
-    echo "  1. pj-fix-home-permission"
-    echo "  2. pj-fix-permissions <type> <name>"
-    echo "  3. pj-verify-access <type> <name>"
+    echo -e "${CYAN}TROUBLESHOOTING GUIDE:${NC}"
+    echo "  If website not accessible:"
+    echo "  1. pj-troubleshoot domain.test    - Auto-diagnose connection issues"
+    echo "  2. pj-network-status              - Check service status"
+    echo "  3. pj-restart-services            - Restart Nginx & PHP-FPM"
+    echo "  4. pj-fix-home-permission         - Fix permission issues"
+    echo "  5. pj-fix-permissions <type> <name> - Fix project permissions"
+    echo ""
+    echo -e "${YELLOW}COMMON ISSUES & SOLUTIONS:${NC}"
+    echo "  ❌ 'Could not connect to server'"
+    echo "     → pj-troubleshoot domain.test"
+    echo "     → pj-restart-services"
+    echo ""
+    echo "  ❌ 'Primary script unknown'"
+    echo "     → pj-fix-home-permission"
+    echo "     → pj-fix-permissions <type> <name>"
+    echo "     → pj-verify-access <type> <name>"
+    echo ""
+    echo "  ❌ SSL certificate warnings"
+    echo "     → pj-trust-setup"
+    echo "     → pj-mkcert-setup"
+    echo ""
+    echo "  ❌ Nginx configuration errors"
+    echo "     → pj-fix <type> <name>"
+    echo "     → pj-troubleshoot domain.test"
 }
 
 # Main function dispatcher
@@ -1371,6 +1579,15 @@ project_manager() {
             ;;
         "fix-home-permission")
             fix_home_permission
+            ;;
+        "troubleshoot")
+            troubleshoot_connection $2
+            ;;
+        "network-status")
+            show_network_status
+            ;;
+        "restart-services")
+            restart_services
             ;;
         "help"|"--help"|"-h")
             show_detailed_help
