@@ -18,8 +18,8 @@ NC='\033[0m' # No Color
 # Icons
 ICON_CHECK="✅"
 ICON_ERROR="❌"
-ICON_WARN="⚠️"
-ICON_INFO="ℹ️"
+ICON_WARN="⚠️ "
+ICON_INFO="ℹ️ "
 ICON_GEAR="🔧"
 ICON_PACKAGE="📦"
 ICON_SERVER="🚀"
