@@ -195,6 +195,10 @@ setup_aliases() {
         "alias pj-troubleshoot='$script_path troubleshoot'"
         "alias pj-network-status='$script_path network-status'"
         "alias pj-restart-services='$script_path restart-services'"
+        "alias pj-production-nextjs='$script_path production-nextjs'"
+        "alias pj-development-nextjs='$script_path development-nextjs'"
+        "alias pj-watch-nextjs='$script_path watch-nextjs'"
+        "alias pj-build-nextjs='$script_path build-nextjs'"
         ""
     )
     
@@ -206,28 +210,43 @@ setup_aliases() {
     echo -e "${ICON_CHECK} Aliases added to $shell_config"
     echo ""
     echo -e "${CYAN}AVAILABLE ALIASES:${NC}"
+    echo "  ${GREEN}PROJECT MANAGEMENT:${NC}"
     echo "  project, pj          - Main project manager"
     echo "  pj-create            - Create new project"
     echo "  pj-setup             - Setup existing project"
     echo "  pj-list              - List all projects"
     echo "  pj-code              - Open project in VS Code"
     echo "  pj-delete            - Delete project"
+    echo "  pj-exists            - Check if project exists"
+    echo "  pj-fix               - Fix project configuration"
+    echo ""
+    echo "  ${BLUE}SSL & SECURITY:${NC}"
     echo "  pj-mkcert            - Setup mkcert for SSL"
     echo "  pj-trust             - Setup browser trust"
+    echo "  pj-enable-ssl        - Enable SSL for project"
+    echo "  pj-disable-ssl       - Disable SSL for project"
+    echo ""
+    echo "  ${YELLOW}SYSTEM & ENVIRONMENT:${NC}"
     echo "  pj-symlink           - Setup projects symlink"
     echo "  pj-info              - Show environment info"
     echo "  pj-env               - Show environment paths"
-    echo "  pj-exists            - Check if project exists"
-    echo "  pj-fix               - Fix project configuration"
-    echo "  pj-enable-ssl        - Enable SSL for project"
-    echo "  pj-disable-ssl       - Disable SSL for project"
     echo "  pj-alias             - Setup aliases (this command)"
+    echo "  pj-restart-services  - Restart web services"
+    echo ""
+    echo "  ${PURPLE}PERMISSIONS & ACCESS:${NC}"
     echo "  pj-fix-permissions   - Fix project permissions"
     echo "  pj-verify-access     - Verify project web accessibility"
     echo "  pj-fix-home-permission - Fix home directory permission"
+    echo ""
+    echo "  ${RED}TROUBLESHOOTING:${NC}"
     echo "  pj-troubleshoot      - Troubleshoot connection issues"
     echo "  pj-network-status    - Show network and service status"
-    echo "  pj-restart-services  - Restart web services"
+    echo ""
+    echo "  ${CYAN}NEXT.JS SPECIFIC:${NC}"
+    echo "  pj-production-nextjs - Switch Next.js to production mode"
+    echo "  pj-development-nextjs - Switch Next.js to development mode"
+    echo "  pj-watch-nextjs      - Auto-build Next.js on file changes"
+    echo "  pj-build-nextjs      - One-time Next.js production build"
     echo ""
     echo -e "${YELLOW}To use aliases immediately, run:${NC}"
     echo "  source $shell_config"
@@ -765,12 +784,15 @@ setup_nginx_config() {
         sudo rm -f "$NGINX_ENABLED/$domain"
     fi
     
-    # Detect PHP version and connection
-    local php_connection=$(get_php_fpm_connection)
-    local php_version=$(detect_php_version)
-    
-    echo -e "${ICON_INFO} Detected PHP: $php_version"
-    echo -e "${ICON_INFO} PHP-FPM Connection: $php_connection"
+    # Detect PHP version and connection (hanya untuk PHP projects)
+    local php_connection=""
+    local php_version=""
+    if [ "$project_type" != "nextjs" ]; then
+        php_connection=$(get_php_fpm_connection)
+        php_version=$(detect_php_version)
+        echo -e "${ICON_INFO} Detected PHP: $php_version"
+        echo -e "${ICON_INFO} PHP-FPM Connection: $php_connection"
+    fi
     
     # Define correct root paths for each project type
     local nginx_root_path=""
@@ -810,8 +832,57 @@ setup_nginx_config() {
     
     # Create nginx config with or without SSL
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
-        # Config with SSL - FIXED: Use actual value, not variable
-        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+        # Config dengan SSL
+        if [ "$project_type" = "nextjs" ]; then
+            # Next.js SSL config - FIXED
+            sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# Next.js Production Mode - Static Files with SSL
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $domain www.$domain;
+    
+    ssl_certificate $ssl_cert;
+    ssl_certificate_key $ssl_key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    
+    root $nginx_root_path/out;
+    index index.html index.htm;
+    
+    # Static file caching
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # HTML files - minimal caching
+    location ~* \.html$ {
+        expires 5m;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    
+    # SPA routing support
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+    
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+}
+EOF
+            echo -e "${ICON_CHECK} SSL configuration applied for Next.js"
+        else
+            # PHP projects SSL config
+            sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
 # HTTP to HTTPS redirect
 server {
     listen 80;
@@ -862,10 +933,47 @@ server {
     }
 }
 EOF
-        echo -e "${ICON_CHECK} SSL configuration applied"
+            echo -e "${ICON_CHECK} SSL configuration applied for PHP project"
+        fi
     else
-        # Config without SSL (HTTP only) - FIXED: Use actual value, not variable
-        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+        # Config tanpa SSL (HTTP only)
+        if [ "$project_type" = "nextjs" ]; then
+            # Next.js HTTP config
+            sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# Next.js Production Mode - Static Files
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    
+    root $nginx_root_path/out;
+    index index.html index.htm;
+    
+    # Static file caching
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # HTML files - minimal caching
+    location ~* \.html$ {
+        expires 5m;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    
+    # SPA routing support
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+    
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+}
+EOF
+            echo -e "${ICON_CHECK} HTTP-only configuration applied for Next.js"
+        else
+            # PHP projects HTTP config
+            sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -898,7 +1006,8 @@ server {
     }
 }
 EOF
-        echo -e "${ICON_CHECK} HTTP-only configuration applied"
+            echo -e "${ICON_CHECK} HTTP-only configuration applied for PHP project"
+        fi
     fi
     
     # Enable site
@@ -928,13 +1037,97 @@ EOF
     echo -e "${ICON_SUCCESS} Project setup completed!"
     echo -e "${ICON_FOLDER} Local Path: $PROJECTS_ROOT/$project_type/$project_name"
     echo -e "${ICON_NETWORK} Nginx Path: $nginx_root_path"
-    echo -e "${ICON_CODE} PHP: $php_version via $php_connection"
+    
+    # Framework-specific messages
+    case $project_type in
+        "laravel"|"codeigniter3")
+            echo -e "${ICON_CODE} PHP: $php_version via $php_connection"
+            ;;
+        "nextjs")
+            echo -e "${ICON_NETWORK} Node.js: Static files serving"
+            if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+                echo -e "${ICON_INFO} Mode: Production with SSL - No server required"
+            else
+                echo -e "${ICON_INFO} Mode: Production (Static) - No server required"
+            fi
+            ;;
+    esac
+    
+    # SSL status dengan message yang sesuai
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
         echo -e "${ICON_SECURITY} SSL: ENABLED"
-        echo -e "${ICON_NETWORK} URLs: http://$domain → https://$domain"
+        if [ "$project_type" = "nextjs" ]; then
+            echo -e "${ICON_NETWORK} URL: https://$domain (Secure)"
+            echo -e "${ICON_INFO} HTTP automatically redirects to HTTPS"
+        else
+            echo -e "${ICON_NETWORK} URLs: http://$domain → https://$domain"
+        fi
     else
         echo -e "${ICON_SECURITY} SSL: DISABLED"
         echo -e "${ICON_NETWORK} URL: http://$domain"
+    fi
+    
+    # Next.js specific instructions
+    if [ "$project_type" = "nextjs" ]; then
+        echo ""
+        echo -e "${CYAN}NEXT.JS HYBRID INSTRUCTIONS:${NC}"
+        
+        if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+            echo -e "  ${GREEN}🔒 Production Mode with SSL:${NC} (Current)"
+            echo -e "    → Access: https://$domain (secure, always available)"
+            echo -e "    → Build: npm run build:production"
+            echo -e "    → Auto-build: pj-watch-nextjs $project_name"
+        else
+            echo -e "  ${GREEN}🎯 Production Mode:${NC} (Current)"
+            echo -e "    → Access: http://$domain (always available)"
+            echo -e "    → Build: npm run build:production"
+            echo -e "    → Auto-build: pj-watch-nextjs $project_name"
+        fi
+        
+        echo ""
+        echo -e "  ${BLUE}🔧 Development Mode:${NC}"
+        echo -e "    → Switch: pj-development-nextjs $project_name"
+        echo -e "    → Start: npm run dev"
+        echo -e "    → Access: http://localhost:3001 (hot reload)"
+        
+        # Auto-create placeholder untuk SSL projects
+        if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+            local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+            mkdir -p "$project_path/out"
+            
+            if [ ! -f "$project_path/out/index.html" ]; then
+                cat > "$project_path/out/index.html" << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Next.js - SSL Ready</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 2rem; text-align: center; }
+        .ssl-ready { background: #e8f5e8; padding: 1rem; border-radius: 5px; border: 2px solid #4caf50; }
+        .instructions { background: #f0f0f0; padding: 1rem; margin: 2rem auto; max-width: 500px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="ssl-ready">
+        <h1>🔒 SSL Ready!</h1>
+        <p>Your Next.js project is configured for HTTPS</p>
+        <p><strong>Domain:</strong> $domain</p>
+        <p><strong>Status:</strong> SSL Certificate Installed</p>
+    </div>
+    <div class="instructions">
+        <h3>Next Steps:</h3>
+        <p>1. Build your Next.js project:</p>
+        <code>npm run build:production</code>
+        <p>2. Or enable auto-build:</p>
+        <code>pj-watch-nextjs $project_name</code>
+        <p>3. Your site is available at: <strong>https://$domain</strong></p>
+    </div>
+</body>
+</html>
+EOF
+                echo -e "${ICON_CHECK} Created SSL-ready placeholder page for immediate testing"
+            fi
+        fi
     fi
 }
 
@@ -1418,6 +1611,585 @@ restart_services() {
     show_network_status
 }
 
+# Function untuk setup Next.js hybrid environment
+setup_nextjs_hybrid() {
+    local project_name=$1
+    local domain=$2
+    local enable_ssl=${3:-false}
+    local default_mode=${4:-"production"}  # production | development
+    
+    echo -e "${ICON_GEAR} Setting up Next.js Hybrid Environment: $project_name"
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    
+    # Create project directory
+    mkdir -p "$project_path"
+    
+    # Create enhanced package.json dengan semua scripts
+    if [ ! -f "$project_path/package.json" ]; then
+        echo -e "${ICON_INFO} Creating Next.js project with hybrid scripts..."
+        cat > "$project_path/package.json" << EOF
+{
+  "name": "$project_name",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start -p 3001",
+    "export": "next build && next export",
+    "build:watch": "chokidar 'pages/**/*' 'components/**/*' 'styles/**/*' 'app/**/*' -c 'npm run build && npm run export'",
+    "build:production": "npm run build && npm run export",
+    "serve:static": "serve out -p 3002",
+    "dev:with-proxy": "npm run dev & npm run serve:static",
+    "switch:production": "echo 'Switching to production mode...' && npm run build:production",
+    "switch:development": "echo 'Switching to development mode...'"
+  },
+  "dependencies": {
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "serve": "latest"
+  },
+  "devDependencies": {
+    "chokidar-cli": "latest",
+    "concurrently": "latest"
+  }
+}
+EOF
+    fi
+    
+    # Create project structure
+    mkdir -p "$project_path/pages"
+    mkdir -p "$project_path/components" 
+    mkdir -p "$project_path/styles"
+    mkdir -p "$project_path/public"
+    mkdir -p "$project_path/out"  # Static export directory
+    
+    # Create hybrid homepage
+    cat > "$project_path/pages/index.js" << 'EOF'
+import { useState, useEffect } from 'react'
+
+export default function Home() {
+  const [lastBuilt, setLastBuilt] = useState('')
+  const [currentMode, setCurrentMode] = useState('production')
+  
+  useEffect(() => {
+    setLastBuilt(new Date().toLocaleString())
+    // Detect mode from URL atau environment
+    if (window.location.port === '3001') {
+      setCurrentMode('development')
+    } else {
+      setCurrentMode('production')
+    }
+  }, [])
+  
+  return (
+    <div style={{ padding: '2rem', fontFamily: 'Arial, sans-serif', maxWidth: '800px', margin: '0 auto' }}>
+      <h1>🚀 Next.js Hybrid Environment</h1>
+      
+      <div style={{ 
+        background: currentMode === 'development' ? '#e8f5e8' : '#e8f4ff', 
+        padding: '1rem', 
+        margin: '1rem 0', 
+        borderRadius: '5px',
+        border: `2px solid ${currentMode === 'development' ? '#4caf50' : '#2196f3'}`
+      }}>
+        <strong>Current Mode:</strong> 
+        <span style={{ 
+          color: currentMode === 'development' ? '#2e7d32' : '#1976d2',
+          fontWeight: 'bold',
+          marginLeft: '0.5rem'
+        }}>
+          {currentMode.toUpperCase()}
+        </span>
+        {currentMode === 'development' && (
+          <span style={{ color: '#4caf50', marginLeft: '1rem' }}>● Live</span>
+        )}
+        {currentMode === 'production' && (
+          <span style={{ color: '#2196f3', marginLeft: '1rem' }}>● Static</span>
+        )}
+      </div>
+      
+      <div style={{ background: '#f5f5f5', padding: '1rem', borderRadius: '5px' }}>
+        <strong>Last Built:</strong> {lastBuilt || 'Not built yet'}
+      </div>
+      
+      <div style={{ marginTop: '2rem', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+        <div style={{ border: '1px solid #ddd', padding: '1rem', borderRadius: '5px' }}>
+          <h3>🎯 Production Mode</h3>
+          <p><strong>Access:</strong> http://YOUR-DOMAIN.test</p>
+          <p><strong>Features:</strong></p>
+          <ul>
+            <li>Always accessible</li>
+            <li>Static files</li>
+            <li>Fast loading</li>
+            <li>No server required</li>
+          </ul>
+        </div>
+        
+        <div style={{ border: '1px solid #ddd', padding: '1rem', borderRadius: '5px' }}>
+          <h3>🔧 Development Mode</h3>
+          <p><strong>Access:</strong> http://localhost:3001</p>
+          <p><strong>Features:</strong></p>
+          <ul>
+            <li>Hot reload</li>
+            <li>Live development</li>
+            <li>Debug tools</li>
+            <li>Instant updates</li>
+          </ul>
+        </div>
+      </div>
+      
+      <div style={{ marginTop: '2rem', padding: '1rem', background: '#fff3cd', borderRadius: '5px' }}>
+        <h3>🔄 Switch Between Modes:</h3>
+        <p>Use the project manager commands to switch between modes:</p>
+        <code>pj-production-nextjs {process.env.PROJECT_NAME || 'project-name'}</code><br/>
+        <code>pj-development-nextjs {process.env.PROJECT_NAME || 'project-name'}</code>
+      </div>
+    </div>
+  )
+}
+EOF
+
+    # Setup initial Nginx config berdasarkan default mode
+    if [ "$default_mode" = "production" ]; then
+        setup_nextjs_production_mode "$project_name" "$domain" "$enable_ssl"
+    else
+        setup_nextjs_development_mode "$project_name" "$domain" "$enable_ssl"
+    fi
+    
+    echo -e "${ICON_SUCCESS} Next.js Hybrid Environment setup completed!"
+    echo -e "${ICON_FOLDER} Project Path: $project_path"
+    echo ""
+    echo -e "${CYAN}AVAILABLE MODES:${NC}"
+    echo -e "  ${GREEN}🎯 Production Mode${NC}  - Static files, always on"
+    echo -e "    Access: http://$domain"
+    echo -e "  ${BLUE}🔧 Development Mode${NC} - Live server, hot reload"  
+    echo -e "    Access: http://localhost:3001"
+    echo ""
+    echo -e "${YELLOW}SWITCH COMMANDS:${NC}"
+    echo "  pj-production-nextjs $project_name    # Switch to production mode"
+    echo "  pj-development-nextjs $project_name   # Switch to development mode"
+    echo "  pj-watch-nextjs $project_name         # Auto-build for production"
+    echo ""
+    echo -e "${GREEN}QUICK START:${NC}"
+    echo "  cd $project_path"
+    echo "  npm install"
+    echo "  # Choose your mode above ↑"
+}
+
+# Function untuk Production Mode (Static files)
+setup_nextjs_production_mode() {
+    local project_name=$1
+    local domain=$2
+    local enable_ssl=${3:-false}
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    local static_path="$project_path/out"
+    local ssl_cert=""
+    local ssl_key=""
+    
+    echo -e "${ICON_GEAR} Switching to PRODUCTION mode: $project_name"
+    
+    # Ensure static directory exists
+    mkdir -p "$static_path"
+    
+    # Create build status file
+    if [ ! -f "$static_path/index.html" ]; then
+        cat > "$static_path/index.html" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Next.js - Production Mode</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 2rem; text-align: center; }
+        .production { background: #e8f4ff; padding: 1rem; border-radius: 5px; border: 2px solid #2196f3; }
+        .instructions { background: #f0f0f0; padding: 1rem; margin: 2rem auto; max-width: 500px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="production">
+        <h1>🎯 Production Mode</h1>
+        <p>Static files served via Nginx</p>
+    </div>
+    <div class="instructions">
+        <h3>Run these commands to build:</h3>
+        <code>npm run build:production</code><br><br>
+        <strong>Or enable auto-build:</strong><br>
+        <code>pj-watch-nextjs '$project_name'</code>
+    </div>
+</body>
+</html>
+EOF
+    fi
+    
+    # Generate SSL jika needed
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+        if generate_ssl_cert "$domain"; then
+            ssl_cert="$CERT_ROOT/$domain.pem"
+            ssl_key="$CERT_ROOT/$domain-key.pem"
+        fi
+    fi
+    
+    # Production Nginx Config - Static Files
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
+        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# Next.js Production Mode - Static Files
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $domain www.$domain;
+    
+    ssl_certificate $ssl_cert;
+    ssl_certificate_key $ssl_key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    
+    root $static_path;
+    index index.html index.htm;
+    
+    # Static file caching
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # HTML files - minimal caching
+    location ~* \.html$ {
+        expires 5m;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    
+    # SPA routing support
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+    
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+}
+EOF
+    else
+        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# Next.js Production Mode - Static Files
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    
+    root $static_path;
+    index index.html index.htm;
+    
+    # Static file caching
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # HTML files - minimal caching
+    location ~* \.html$ {
+        expires 5m;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    
+    # SPA routing support
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+    
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+}
+EOF
+    fi
+    
+    # Apply configuration
+    sudo ln -sf "$NGINX_AVAILABLE/$domain" "$NGINX_ENABLED/$domain"
+    add_to_hosts "$domain"
+    
+    if sudo nginx -t; then
+        sudo service nginx reload
+        echo -e "${ICON_CHECK} Switched to PRODUCTION mode"
+        echo -e "${CYAN}Access: http://$domain${NC}"
+    else
+        echo -e "${ICON_ERROR} Failed to switch to production mode"
+        return 1
+    fi
+}
+
+# Function untuk Development Mode (Proxy to dev server)
+setup_nextjs_development_mode() {
+    local project_name=$1
+    local domain=$2
+    local enable_ssl=${3:-false}
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    local ssl_cert=""
+    local ssl_key=""
+    
+    echo -e "${ICON_GEAR} Switching to DEVELOPMENT mode: $project_name"
+    
+    # Generate SSL jika needed
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+        if generate_ssl_cert "$domain"; then
+            ssl_cert="$CERT_ROOT/$domain.pem"
+            ssl_key="$CERT_ROOT/$domain-key.pem"
+        fi
+    fi
+    
+    # Development Nginx Config - Proxy to Dev Server
+    if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
+        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# Next.js Development Mode - Proxy to Dev Server
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $domain www.$domain;
+    
+    ssl_certificate $ssl_cert;
+    ssl_certificate_key $ssl_key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    
+    # Proxy to Next.js dev server (port 3001)
+    location / {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # WebSocket support for HMR
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Longer timeouts for development
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+}
+EOF
+    else
+        sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+# Next.js Development Mode - Proxy to Dev Server
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    
+    # Proxy to Next.js dev server (port 3001)
+    location / {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # WebSocket support for HMR
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Longer timeouts for development
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    access_log /var/log/nginx/projects/${domain}-access.log;
+    error_log /var/log/nginx/projects/${domain}-error.log;
+}
+EOF
+    fi
+    
+    # Apply configuration
+    sudo ln -sf "$NGINX_AVAILABLE/$domain" "$NGINX_ENABLED/$domain"
+    add_to_hosts "$domain"
+    
+    if sudo nginx -t; then
+        sudo service nginx reload
+        echo -e "${ICON_CHECK} Switched to DEVELOPMENT mode"
+        echo -e "${CYAN}Access via proxy: http://$domain${NC}"
+        echo -e "${CYAN}Access directly: http://localhost:3001${NC}"
+        echo -e "${YELLOW}Remember to start dev server: npm run dev${NC}"
+    else
+        echo -e "${ICON_ERROR} Failed to switch to development mode"
+        return 1
+    fi
+}
+
+# Function untuk switch ke production mode
+switch_nextjs_production() {
+    local project_name=$1
+    
+    if [ -z "$project_name" ]; then
+        echo -e "${ICON_ERROR} Usage: switch-nextjs-production <project-name>"
+        return 1
+    fi
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    
+    if [ ! -d "$project_path" ]; then
+        echo -e "${ICON_ERROR} Next.js project not found: $project_path"
+        return 1
+    fi
+    
+    # Get domain from existing config atau use default
+    local domain="${project_name}.test"
+    
+    setup_nextjs_production_mode "$project_name" "$domain"
+    
+    echo -e "${ICON_SUCCESS} Now in PRODUCTION mode!"
+    echo -e "${GREEN}To build your project:${NC}"
+    echo "  cd $project_path"
+    echo "  npm run build:production"
+    echo ""
+    echo -e "${GREEN}For auto-rebuild:${NC}"
+    echo "  pj-watch-nextjs $project_name"
+}
+
+# Function untuk switch ke development mode  
+switch_nextjs_development() {
+    local project_name=$1
+    
+    if [ -z "$project_name" ]; then
+        echo -e "${ICON_ERROR} Usage: switch-nextjs-development <project-name>"
+        return 1
+    fi
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    
+    if [ ! -d "$project_path" ]; then
+        echo -e "${ICON_ERROR} Next.js project not found: $project_path"
+        return 1
+    fi
+    
+    # Get domain from existing config atau use default
+    local domain="${project_name}.test"
+    
+    setup_nextjs_development_mode "$project_name" "$domain"
+    
+    echo -e "${ICON_SUCCESS} Now in DEVELOPMENT mode!"
+    echo -e "${BLUE}Start development server:${NC}"
+    echo "  cd $project_path"
+    echo "  npm run dev"
+    echo ""
+    echo -e "${BLUE}Access via:${NC}"
+    echo "  http://$domain (through proxy)"
+    echo "  http://localhost:3001 (direct)"
+}
+
+# Enhanced watcher dengan mode awareness
+start_nextjs_watcher() {
+    local project_name=$1
+    
+    if [ -z "$project_name" ]; then
+        echo -e "${ICON_ERROR} Usage: start-nextjs-watcher <project-name>"
+        return 1
+    fi
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    
+    if [ ! -d "$project_path" ]; then
+        echo -e "${ICON_ERROR} Next.js project not found: $project_path"
+        return 1
+    fi
+    
+    echo -e "${ICON_GEAR} Starting Next.js Auto-build Watcher: $project_name"
+    
+    cd "$project_path"
+    
+    # Check current mode
+    if grep -q "Proxy to Next.js dev server" "/etc/nginx/sites-available/${project_name}.test" 2>/dev/null; then
+        echo -e "${ICON_WARN} Currently in DEVELOPMENT mode - switch to PRODUCTION for auto-build"
+        echo -e "${YELLOW}Run: pj-production-nextjs $project_name${NC}"
+        return 1
+    fi
+    
+    # Install dependencies jika belum
+    if [ ! -d "node_modules" ]; then
+        echo -e "${ICON_INFO} Installing dependencies..."
+        npm install
+    fi
+    
+    # Build pertama kali
+    echo -e "${ICON_INFO} Running initial build..."
+    npm run build:production
+    
+    echo -e "${ICON_SUCCESS} Auto-build watcher started!"
+    echo -e "${CYAN}Mode: PRODUCTION (Static files)${NC}"
+    echo -e "${CYAN}Watching for file changes...${NC}"
+    echo -e "${CYAN}Access: http://${project_name}.test${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop${NC}"
+    
+    # Start file watcher dengan better output
+    npx chokidar 'pages/**/*' 'components/**/*' 'styles/**/*' 'app/**/*' 'public/**/*' \
+        -c 'echo "📦 [$(date +"%T")] Changes detected → Rebuilding..." && npm run build:production && echo "✅ [$(date +"%T")] Build completed - Refresh browser!"'
+}
+
+# Function untuk one-time build Next.js production
+build_nextjs_production() {
+    local project_name=$1
+    
+    if [ -z "$project_name" ]; then
+        echo -e "${ICON_ERROR} Usage: build-nextjs <project-name>"
+        return 1
+    fi
+    
+    local project_path="$PROJECTS_ROOT/nextjs/$project_name"
+    
+    if [ ! -d "$project_path" ]; then
+        echo -e "${ICON_ERROR} Next.js project not found: $project_path"
+        return 1
+    fi
+    
+    echo -e "${ICON_GEAR} Building Next.js for production: $project_name"
+    
+    cd "$project_path"
+    
+    # Install dependencies jika belum
+    if [ ! -d "node_modules" ]; then
+        echo -e "${ICON_INFO} Installing dependencies..."
+        npm install
+    fi
+    
+    # Build production
+    if npm run build:production; then
+        echo -e "${ICON_SUCCESS} Production build completed!"
+        echo -e "${CYAN}Access: http://${project_name}.test${NC}"
+    else
+        echo -e "${ICON_ERROR} Build failed!"
+        return 1
+    fi
+}
+
 # Function to show detailed help with aliases
 show_detailed_help() {
     show_header
@@ -1447,8 +2219,13 @@ show_detailed_help() {
     echo "  project troubleshoot [domain]"
     echo "  project network-status"
     echo "  project restart-services"
+    echo "  project production-nextjs <name>"
+    echo "  project development-nextjs <name>"
+    echo "  project watch-nextjs <name>"
+    echo "  project build-nextjs <name>"
     echo ""
     echo -e "${YELLOW}QUICK ALIASES:${NC}"
+    echo "  ${GREEN}Project Management:${NC}"
     echo "  pj-create <type> <name> <domain> [ssl]"
     echo "  pj-setup <type> <name> <domain> [ssl]"
     echo "  pj-list"
@@ -1458,52 +2235,88 @@ show_detailed_help() {
     echo "  pj-fix <type> <name> [domain]"
     echo "  pj-enable-ssl <type> <name> [domain]"
     echo "  pj-disable-ssl <type> <name> [domain]"
+    echo ""
+    echo "  ${BLUE}System & Security:${NC}"
     echo "  pj-mkcert"
     echo "  pj-trust"
     echo "  pj-symlink"
     echo "  pj-info"
     echo "  pj-env"
     echo "  pj-alias"
+    echo "  pj-restart-services"
+    echo ""
+    echo "  ${PURPLE}Permissions & Access:${NC}"
     echo "  pj-fix-permissions"
     echo "  pj-verify-access"
     echo "  pj-fix-home-permission"
+    echo ""
+    echo "  ${RED}Troubleshooting:${NC}"
     echo "  pj-troubleshoot [domain]"
     echo "  pj-network-status"
-    echo "  pj-restart-services"
+    echo ""
+    echo "  ${CYAN}Next.js Specific:${NC}"
+    echo "  pj-production-nextjs <name>"
+    echo "  pj-development-nextjs <name>"
+    echo "  pj-watch-nextjs <name>"
+    echo "  pj-build-nextjs <name>"
     echo ""
     echo -e "${BLUE}EXAMPLES:${NC}"
+    echo "  ${GREEN}Basic Usage:${NC}"
     echo "  pj-create laravel myapp myapp.test"
     echo "  pj-create ci3 myapp myapp.test ssl"
     echo "  pj-setup laravel existing-app app.test"
     echo "  pj-exists ci3 myapp"
     echo "  pj-fix laravel myapp"
     echo "  pj-enable-ssl ci3 myapp"
+    echo "  pj-list"
+    echo ""
+    echo "  ${CYAN}Next.js Hybrid Workflow:${NC}"
+    echo "  pj-create nextjs samos-next samos-next.test"
+    echo "  pj-production-nextjs samos-next    # Static mode (always accessible)"
+    echo "  pj-watch-nextjs samos-next         # Auto-build on changes"
+    echo "  pj-development-nextjs samos-next   # Dev mode (hot reload)"
+    echo "  # Then: cd ~/Projects/www/nextjs/samos-next && npm run dev"
+    echo ""
+    echo "  ${RED}Troubleshooting:${NC}"
     echo "  pj-troubleshoot myapp.test"
     echo "  pj-network-status"
     echo "  pj-restart-services"
-    echo "  pj-list"
     echo "  pj-fix-home-permission"
     echo ""
     echo -e "${PURPLE}PROJECT TYPES:${NC}"
     echo "  laravel, nextjs, ci3 (codeigniter3)"
     echo ""
-    echo -e "${CYAN}TROUBLESHOOTING GUIDE:${NC}"
-    echo "  If website not accessible:"
-    echo "  1. pj-troubleshoot domain.test    - Auto-diagnose connection issues"
-    echo "  2. pj-network-status              - Check service status"
-    echo "  3. pj-restart-services            - Restart Nginx & PHP-FPM"
-    echo "  4. pj-fix-home-permission         - Fix permission issues"
-    echo "  5. pj-fix-permissions <type> <name> - Fix project permissions"
+    echo -e "${CYAN}NEXT.JS HYBRID ENVIRONMENT:${NC}"
+    echo "  🎯 ${GREEN}Production Mode${NC} - Static files, always accessible"
+    echo "     → pj-production-nextjs <name>"
+    echo "     → Access: http://domain.test (instantly)"
+    echo "     → Features: Fast, no server needed, auto-build available"
     echo ""
-    echo -e "${YELLOW}COMMON ISSUES & SOLUTIONS:${NC}"
+    echo "  🔧 ${BLUE}Development Mode${NC} - Live server with hot reload"
+    echo "     → pj-development-nextjs <name>"
+    echo "     → Access: http://domain.test (proxy) or http://localhost:3001"
+    echo "     → Features: Hot reload, debug tools, instant updates"
+    echo ""
+    echo "  🔄 ${YELLOW}Auto-build Watcher${NC} - Build on file changes"
+    echo "     → pj-watch-nextjs <name>"
+    echo "     → Requires: Production mode"
+    echo "     → Features: Automatic rebuilds, browser refresh ready"
+    echo ""
+    echo -e "${RED}TROUBLESHOOTING GUIDE:${NC}"
     echo "  ❌ 'Could not connect to server'"
     echo "     → pj-troubleshoot domain.test"
     echo "     → pj-restart-services"
+    echo "     → pj-network-status"
     echo ""
     echo "  ❌ 'Primary script unknown'"
     echo "     → pj-fix-home-permission"
     echo "     → pj-fix-permissions <type> <name>"
     echo "     → pj-verify-access <type> <name>"
+    echo ""
+    echo "  ❌ Next.js not working"
+    echo "     → pj-production-nextjs <name> (for static mode)"
+    echo "     → pj-development-nextjs <name> (for dev server)"
+    echo "     → Check mode: pj-network-status"
     echo ""
     echo "  ❌ SSL certificate warnings"
     echo "     → pj-trust-setup"
@@ -1512,6 +2325,15 @@ show_detailed_help() {
     echo "  ❌ Nginx configuration errors"
     echo "     → pj-fix <type> <name>"
     echo "     → pj-troubleshoot domain.test"
+    echo ""
+    echo -e "${GREEN}QUICK START FOR NEXT.JS:${NC}"
+    echo "  1. pj-create nextjs mynextapp mynextapp.test"
+    echo "  2. cd ~/Projects/www/nextjs/mynextapp"
+    echo "  3. npm install"
+    echo "  4. Choose your mode:"
+    echo "     - pj-production-nextjs mynextapp + pj-watch-nextjs mynextapp"
+    echo "     - OR pj-development-nextjs mynextapp + npm run dev"
+    echo "  5. Access: http://mynextapp.test"
 }
 
 # Main function dispatcher
@@ -1589,6 +2411,18 @@ project_manager() {
         "restart-services")
             restart_services
             ;;
+        "production-nextjs")
+            switch_nextjs_production $2
+            ;;
+        "development-nextjs")
+            switch_nextjs_development $2
+            ;;
+        "watch-nextjs")
+            start_nextjs_watcher $2
+            ;;
+        "build-nextjs")
+            build_nextjs_production $2
+            ;;
         "help"|"--help"|"-h")
             show_detailed_help
             ;;
@@ -1599,6 +2433,7 @@ project_manager() {
             else
                 echo -e "${ICON_ERROR} Unknown command: $1"
                 echo "Use 'project help' for available commands"
+                echo "Or 'project setup-alias' to install quick aliases"
             fi
             ;;
     esac
