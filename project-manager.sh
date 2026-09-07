@@ -199,6 +199,12 @@ setup_aliases() {
         "alias pj-development-nextjs='$script_path development-nextjs'"
         "alias pj-watch-nextjs='$script_path watch-nextjs'"
         "alias pj-build-nextjs='$script_path build-nextjs'"
+        "alias pj-repair='$script_path repair'"
+        "alias pj-upgrade-php='$script_path upgrade-php'"
+        "alias pj-change-php='$script_path change-php'"
+        "alias pj-php-list='$script_path php-list'"
+        "alias pj-repair-ssl='$script_path repair-ssl'"
+        "alias pj-check-config='$script_path check-config'"
         ""
     )
     
@@ -409,27 +415,70 @@ generate_ssl_cert() {
     fi
 }
 
-# Function to detect PHP version
-detect_php_version() {
-    # Check for available PHP versions
-    if [ -S "/var/run/php/php8.2-fpm.sock" ]; then
-        echo "8.2"
-    elif [ -S "/var/run/php/php8.1-fpm.sock" ]; then
-        echo "8.1"
-    elif [ -S "/var/run/php/php7.4-fpm.sock" ]; then
-        echo "7.4"
+# ============================================================
+# VALIDATE SSL CERTIFICATE
+# ============================================================
+validate_ssl_certificate() {
+    local domain=$1
+    local cert_path="$CERT_ROOT/$domain.pem"
+    local key_path="$CERT_ROOT/$domain-key.pem"
+    
+    if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+        echo -e "${ICON_CHECK} SSL certificate found: $cert_path"
+        echo -e "${ICON_CHECK} SSL key found: $key_path"
+        return 0
     else
-        # Fallback: check which PHP-FPM services are available
-        if systemctl is-active --quiet php8.2-fpm; then
-            echo "8.2"
-        elif systemctl is-active --quiet php8.1-fpm; then
-            echo "8.1"
-        elif systemctl is-active --quiet php7.4-fpm; then
-            echo "7.4"
+        echo -e "${ICON_WARN} SSL certificate missing for: $domain"
+        echo -e "${ICON_GEAR} Generating new certificate..."
+        if generate_ssl_cert "$domain"; then
+            return 0
         else
-            echo "8.2"  # Default fallback
+            echo -e "${ICON_ERROR} Failed to generate SSL certificate"
+            return 1
         fi
     fi
+}
+
+# Function to detect PHP version
+detect_php_version() {
+    # Check for available PHP versions in multiple paths
+    local socket_paths=(
+        "/run/php"
+        "/var/run/php"
+    )
+    
+    local php_versions=""
+    for path in "${socket_paths[@]}"; do
+        if [ -d "$path" ]; then
+            local versions=$(ls "$path"/php*-fpm.sock 2>/dev/null | grep -oP 'php\K[0-9.]+' | sort -V)
+            if [ -n "$versions" ]; then
+                php_versions="$versions"
+                break
+            fi
+        fi
+    done
+    
+    # If socket files found, use the highest version
+    if [ -n "$php_versions" ]; then
+        echo "$php_versions" | tail -1
+        return 0
+    fi
+    
+    # Fallback: check via systemctl
+    local services=$(systemctl list-units --all --type=service --no-pager 2>/dev/null | grep -oP 'php[0-9.]+-fpm' | grep -oP '[0-9.]+' | sort -V)
+    if [ -n "$services" ]; then
+        echo "$services" | tail -1
+        return 0
+    fi
+    
+    # Try via php command
+    if command -v php &> /dev/null; then
+        php -v 2>/dev/null | head -1 | grep -oP 'PHP \K[0-9.]+'
+        return 0
+    fi
+    
+    # Fallback to latest common version
+    echo "8.5"  # Default untuk Ubuntu 26.04
 }
 
 # Function to get PHP-FPM connection string
@@ -443,12 +492,53 @@ get_php_fpm_connection() {
             if mount | grep -q "/mnt/d.*type ntfs"; then
                 connection="127.0.0.1:9000"  # TCP for NTFS
             else
-                connection="unix:/var/run/php/php${php_version}-fpm.sock"
+                # Try multiple possible socket paths
+                local socket_paths=(
+                    "/run/php/php${php_version}-fpm.sock"      # Primary location
+                    "/var/run/php/php${php_version}-fpm.sock"  # Fallback location
+                )
+                
+                for socket_path in "${socket_paths[@]}"; do
+                    if [ -S "$socket_path" ]; then
+                        connection="unix:$socket_path"
+                        break
+                    fi
+                done
+                
+                # If no socket found, try to find any PHP-FPM socket
+                if [ -z "$connection" ]; then
+                    local found_socket=$(find /run/php /var/run/php -name "php*-fpm.sock" 2>/dev/null | head -1)
+                    if [ -n "$found_socket" ]; then
+                        connection="unix:$found_socket"
+                    else
+                        connection="127.0.0.1:9000"  # Fallback to TCP
+                    fi
+                fi
             fi
             ;;
         "native")
-            # Native: Always use sockets (more efficient)
-            connection="unix:/var/run/php/php${php_version}-fpm.sock"
+            # Native: Try multiple socket paths
+            local socket_paths=(
+                "/run/php/php${php_version}-fpm.sock"      # Primary location
+                "/var/run/php/php${php_version}-fpm.sock"  # Fallback location
+            )
+            
+            for socket_path in "${socket_paths[@]}"; do
+                if [ -S "$socket_path" ]; then
+                    connection="unix:$socket_path"
+                    break
+                fi
+            done
+            
+            # If no socket found, try to find any PHP-FPM socket
+            if [ -z "$connection" ]; then
+                local found_socket=$(find /run/php /var/run/php -name "php*-fpm.sock" 2>/dev/null | head -1)
+                if [ -n "$found_socket" ]; then
+                    connection="unix:$found_socket"
+                else
+                    connection="127.0.0.1:9000"  # Fallback to TCP
+                fi
+            fi
             ;;
     esac
     
@@ -464,12 +554,59 @@ get_php_fpm_connection() {
     echo "$connection"
 }
 
+# Function to check and start PHP-FPM service
+ensure_php_fpm_running() {
+    local php_version=$(detect_php_version)
+    local service_name="php${php_version}-fpm"
+    
+    # Check if service exists
+    if systemctl list-units --all --type=service --no-pager 2>/dev/null | grep -q "$service_name"; then
+        if ! systemctl is-active --quiet "$service_name"; then
+            echo -e "${ICON_WARN} PHP-FPM service $service_name is not running"
+            echo -e "${ICON_GEAR} Starting PHP-FPM service..."
+            sudo systemctl start "$service_name"
+            sleep 2
+            if systemctl is-active --quiet "$service_name"; then
+                echo -e "${ICON_CHECK} PHP-FPM service started"
+            else
+                echo -e "${ICON_WARN} Could not start $service_name, trying to find active PHP-FPM..."
+                # Try to find any running PHP-FPM
+                local active_service=$(systemctl list-units --all --type=service --no-pager 2>/dev/null | grep "php.*-fpm" | grep "active" | grep -oP 'php[0-9.]+-fpm' | head -1)
+                if [ -n "$active_service" ]; then
+                    echo -e "${ICON_INFO} Using active service: $active_service"
+                else
+                    echo -e "${ICON_WARN} No active PHP-FPM service found"
+                fi
+            fi
+        else
+            echo -e "${ICON_CHECK} PHP-FPM service $service_name is running"
+        fi
+    else
+        echo -e "${ICON_WARN} PHP-FPM service $service_name not found"
+        # Try to find any PHP-FPM service
+        local available_service=$(systemctl list-units --all --type=service --no-pager 2>/dev/null | grep "php.*-fpm" | grep -oP 'php[0-9.]+-fpm' | head -1)
+        if [ -n "$available_service" ]; then
+            echo -e "${ICON_INFO} Found PHP-FPM service: $available_service"
+            # Update detected version
+            php_version=$(echo "$available_service" | grep -oP '[0-9.]+')
+        fi
+    fi
+}
+
 # Function to setup symlink
 setup_symlink() {
     echo -e "${ICON_LINK} Setting up symlink..."
     
-    # Remove old symlink if exists
-    sudo rm -f /var/www/projects
+    # Remove old symlink OR directory
+    if [ -L "/var/www/projects" ]; then
+        # Jika symlink, hapus dengan -f
+        sudo rm -f /var/www/projects
+        echo -e "${ICON_CHECK} Removed old symlink"
+    elif [ -d "/var/www/projects" ]; then
+        # Jika folder, hapus dengan -rf
+        sudo rm -rf /var/www/projects
+        echo -e "${ICON_CHECK} Removed old projects directory"
+    fi
     
     # Create symlink to projects directory
     sudo ln -s "$PROJECTS_ROOT" /var/www/projects
@@ -788,10 +925,20 @@ setup_nginx_config() {
     local php_connection=""
     local php_version=""
     if [ "$project_type" != "nextjs" ]; then
+        # Ensure PHP-FPM is running
+        ensure_php_fpm_running
+        
         php_connection=$(get_php_fpm_connection)
         php_version=$(detect_php_version)
         echo -e "${ICON_INFO} Detected PHP: $php_version"
         echo -e "${ICON_INFO} PHP-FPM Connection: $php_connection"
+        
+        # Verify PHP-FPM connection
+        if [[ "$php_connection" == "127.0.0.1:9000" ]]; then
+            echo -e "${ICON_WARN} Using TCP fallback for PHP-FPM"
+        else
+            echo -e "${ICON_CHECK} Using Unix socket for PHP-FPM"
+        fi
     fi
     
     # Define correct root paths for each project type
@@ -820,10 +967,13 @@ setup_nginx_config() {
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
         echo -e "${ICON_SECURITY} Setting up SSL for: $domain"
         
-        if generate_ssl_cert "$domain"; then
+        # Validate and generate certificate
+        if validate_ssl_certificate "$domain"; then
             ssl_cert="$CERT_ROOT/$domain.pem"
             ssl_key="$CERT_ROOT/$domain-key.pem"
             echo -e "${ICON_CHECK} SSL certificate ready"
+            echo -e "${ICON_INFO} Certificate: $ssl_cert"
+            echo -e "${ICON_INFO} Key: $ssl_key"
         else
             echo -e "${ICON_WARN} SSL certificate generation failed, continuing without SSL"
             enable_ssl="false"
@@ -834,7 +984,7 @@ setup_nginx_config() {
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
         # Config dengan SSL
         if [ "$project_type" = "nextjs" ]; then
-            # Next.js SSL config - FIXED
+            # Next.js SSL config
             sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
 # Next.js Production Mode - Static Files with SSL
 server {
@@ -880,9 +1030,19 @@ server {
 }
 EOF
             echo -e "${ICON_CHECK} SSL configuration applied for Next.js"
+            
         else
-            # PHP projects SSL config
-            sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
+            # PHP PROJECTS SSL CONFIG - WITH PROPER CERT INCLUDE
+            if [ ! -f "$ssl_cert" ] || [ ! -f "$ssl_key" ]; then
+                echo -e "${ICON_ERROR} SSL certificate files missing!"
+                echo -e "${ICON_INFO} Cert: $ssl_cert"
+                echo -e "${ICON_INFO} Key: $ssl_key"
+                enable_ssl="false"
+            else
+                echo -e "${ICON_CHECK} SSL Certificate: $ssl_cert"
+                echo -e "${ICON_CHECK} SSL Key: $ssl_key"
+                
+                sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
 # HTTP to HTTPS redirect
 server {
     listen 80;
@@ -897,15 +1057,18 @@ server {
     listen [::]:443 ssl;
     server_name $domain www.$domain;
     
-    # SSL certificates
+    # SSL CERTIFICATE CONFIGURATION - INCLUDED
     ssl_certificate $ssl_cert;
     ssl_certificate_key $ssl_key;
     
-    # SSL settings
+    # SSL security settings
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
     
+    # APPLICATION CONFIGURATION
     root $nginx_root_path;
     index index.php index.html index.htm;
 
@@ -933,10 +1096,14 @@ server {
     }
 }
 EOF
-            echo -e "${ICON_CHECK} SSL configuration applied for PHP project"
+                echo -e "${ICON_CHECK} SSL configuration applied for PHP project"
+                echo -e "${ICON_SECURITY} SSL Certificate included: $ssl_cert"
+                echo -e "${ICON_SECURITY} SSL Key included: $ssl_key"
+            fi
         fi
+        
     else
-        # Config tanpa SSL (HTTP only)
+        # CONFIG TANPA SSL (HTTP ONLY)
         if [ "$project_type" = "nextjs" ]; then
             # Next.js HTTP config
             sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
@@ -1096,7 +1263,7 @@ EOF
             mkdir -p "$project_path/out"
             
             if [ ! -f "$project_path/out/index.html" ]; then
-                cat > "$project_path/out/index.html" << EOF
+                cat > "$project_path/out/index.html" << 'EOF'
 <!DOCTYPE html>
 <html>
 <head>
@@ -1111,7 +1278,7 @@ EOF
     <div class="ssl-ready">
         <h1>🔒 SSL Ready!</h1>
         <p>Your Next.js project is configured for HTTPS</p>
-        <p><strong>Domain:</strong> $domain</p>
+        <p><strong>Domain:</strong> DOMAIN_PLACEHOLDER</p>
         <p><strong>Status:</strong> SSL Certificate Installed</p>
     </div>
     <div class="instructions">
@@ -1119,12 +1286,15 @@ EOF
         <p>1. Build your Next.js project:</p>
         <code>npm run build:production</code>
         <p>2. Or enable auto-build:</p>
-        <code>pj-watch-nextjs $project_name</code>
-        <p>3. Your site is available at: <strong>https://$domain</strong></p>
+        <code>pj-watch-nextjs PROJECT_NAME_PLACEHOLDER</code>
+        <p>3. Your site is available at: <strong>https://DOMAIN_PLACEHOLDER</strong></p>
     </div>
 </body>
 </html>
 EOF
+                # Replace placeholders
+                sed -i "s/DOMAIN_PLACEHOLDER/$domain/g" "$project_path/out/index.html"
+                sed -i "s/PROJECT_NAME_PLACEHOLDER/$project_name/g" "$project_path/out/index.html"
                 echo -e "${ICON_CHECK} Created SSL-ready placeholder page for immediate testing"
             fi
         fi
@@ -1254,8 +1424,20 @@ show_environment_info() {
     echo -e "${ICON_FOLDER} Projects Root: $PROJECTS_ROOT"
     echo -e "${ICON_FOLDER} Certificates: $CERT_ROOT"
     echo -e "${ICON_FOLDER} Scripts: $SCRIPTS_ROOT"
-    echo -e "${ICON_CODE} PHP Version: $(detect_php_version)"
-    echo -e "${ICON_LINK} PHP-FPM Connection: $(get_php_fpm_connection)"
+    
+    # PHP version detection with fallback
+    local php_version=$(detect_php_version)
+    echo -e "${ICON_CODE} PHP Version: $php_version"
+    
+    # PHP-FPM connection
+    local php_connection=$(get_php_fpm_connection)
+    echo -e "${ICON_LINK} PHP-FPM Connection: $php_connection"
+    
+    # Show available PHP-FPM services
+    echo -e "${ICON_INFO} Available PHP-FPM services:"
+    systemctl list-units --all --type=service --no-pager 2>/dev/null | grep "php.*-fpm" | while read line; do
+        echo "   $line"
+    done
     echo ""
     
     # Test essential services
@@ -1266,16 +1448,22 @@ show_environment_info() {
         echo -e "  ${ICON_ERROR} Nginx: STOPPED"
     fi
     
-    if systemctl is-active --quiet mariadb; then
-        echo -e "  ${ICON_CHECK} MariaDB: RUNNING"
+    if systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null; then
+        echo -e "  ${ICON_CHECK} Database: RUNNING"
     else
-        echo -e "  ${ICON_ERROR} MariaDB: STOPPED"
+        echo -e "  ${ICON_WARN} Database: STOPPED or not installed"
     fi
     
-    if systemctl is-active --quiet php8.2-fpm; then
-        echo -e "  ${ICON_CHECK} PHP 8.2 FPM: RUNNING"
-    else
-        echo -e "  ${ICON_WARN} PHP 8.2 FPM: INACTIVE"
+    # Check PHP-FPM services
+    local php_running=false
+    for version in $(detect_php_version); do
+        if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
+            echo -e "  ${ICON_CHECK} PHP $version FPM: RUNNING"
+            php_running=true
+        fi
+    done
+    if [ "$php_running" = false ]; then
+        echo -e "  ${ICON_WARN} PHP-FPM: No active service found"
     fi
     
     # Check home directory permission
@@ -1581,27 +1769,41 @@ restart_services() {
         return 1
     fi
     
-    # Restart PHP-FPM services
+    # Restart PHP-FPM services (dynamic detection)
     echo -e "${ICON_INFO} Restarting PHP-FPM services..."
-    for version in 8.2 8.1 7.4; do
-        if systemctl is-active --quiet "php${version}-fpm"; then
-            sudo systemctl restart "php${version}-fpm"
-            if systemctl is-active --quiet "php${version}-fpm"; then
-                echo -e "   ${ICON_CHECK} PHP ${version} FPM restarted"
-            else
-                echo -e "   ${ICON_WARN} PHP ${version} FPM restart failed"
-            fi
-        fi
-    done
+    local php_services=$(systemctl list-units --all --type=service --no-pager 2>/dev/null | grep "php.*-fpm" | grep -oP 'php[0-9.]+-fpm')
     
-    # Restart MariaDB if running
-    if systemctl is-active --quiet mariadb; then
+    if [ -n "$php_services" ]; then
+        for service in $php_services; do
+            if systemctl is-active --quiet "$service"; then
+                sudo systemctl restart "$service"
+                if systemctl is-active --quiet "$service"; then
+                    echo -e "   ${ICON_CHECK} $service restarted"
+                else
+                    echo -e "   ${ICON_WARN} $service restart failed"
+                fi
+            fi
+        done
+    else
+        echo -e "   ${ICON_WARN} No PHP-FPM services found"
+    fi
+    
+    # Restart MariaDB/MySQL if running
+    if systemctl is-active --quiet mariadb 2>/dev/null; then
         echo -e "${ICON_INFO} Restarting MariaDB..."
         sudo systemctl restart mariadb
         if systemctl is-active --quiet mariadb; then
             echo -e "   ${ICON_CHECK} MariaDB restarted"
         else
             echo -e "   ${ICON_WARN} MariaDB restart failed"
+        fi
+    elif systemctl is-active --quiet mysql 2>/dev/null; then
+        echo -e "${ICON_INFO} Restarting MySQL..."
+        sudo systemctl restart mysql
+        if systemctl is-active --quiet mysql; then
+            echo -e "   ${ICON_CHECK} MySQL restarted"
+        else
+            echo -e "   ${ICON_WARN} MySQL restart failed"
         fi
     fi
     
@@ -1834,7 +2036,7 @@ EOF
     # Production Nginx Config - Static Files
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
         sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
-# Next.js Production Mode - Static Files
+# Next.js Production Mode - Static Files with SSL
 server {
     listen 80;
     listen [::]:80;
@@ -1918,7 +2120,11 @@ EOF
     if sudo nginx -t; then
         sudo service nginx reload
         echo -e "${ICON_CHECK} Switched to PRODUCTION mode"
-        echo -e "${CYAN}Access: http://$domain${NC}"
+        if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+            echo -e "${CYAN}Access: https://$domain${NC}"
+        else
+            echo -e "${CYAN}Access: http://$domain${NC}"
+        fi
     else
         echo -e "${ICON_ERROR} Failed to switch to production mode"
         return 1
@@ -1948,7 +2154,7 @@ setup_nextjs_development_mode() {
     # Development Nginx Config - Proxy to Dev Server
     if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ] && [ -f "$ssl_cert" ] && [ -f "$ssl_key" ]; then
         sudo tee "$NGINX_AVAILABLE/$domain" > /dev/null <<EOF
-# Next.js Development Mode - Proxy to Dev Server
+# Next.js Development Mode - Proxy to Dev Server with SSL
 server {
     listen 80;
     listen [::]:80;
@@ -2036,7 +2242,11 @@ EOF
     if sudo nginx -t; then
         sudo service nginx reload
         echo -e "${ICON_CHECK} Switched to DEVELOPMENT mode"
-        echo -e "${CYAN}Access via proxy: http://$domain${NC}"
+        if [ "$enable_ssl" = "ssl" ] || [ "$enable_ssl" = "true" ]; then
+            echo -e "${CYAN}Access via proxy: https://$domain${NC}"
+        else
+            echo -e "${CYAN}Access via proxy: http://$domain${NC}"
+        fi
         echo -e "${CYAN}Access directly: http://localhost:3001${NC}"
         echo -e "${YELLOW}Remember to start dev server: npm run dev${NC}"
     else
@@ -2061,10 +2271,16 @@ switch_nextjs_production() {
         return 1
     fi
     
-    # Get domain from existing config atau use default
+    # Get domain from existing config or use default
     local domain="${project_name}.test"
     
-    setup_nextjs_production_mode "$project_name" "$domain"
+    # Check current SSL status
+    local enable_ssl="false"
+    if grep -q "listen 443 ssl" "/etc/nginx/sites-available/$domain" 2>/dev/null; then
+        enable_ssl="true"
+    fi
+    
+    setup_nextjs_production_mode "$project_name" "$domain" "$enable_ssl"
     
     echo -e "${ICON_SUCCESS} Now in PRODUCTION mode!"
     echo -e "${GREEN}To build your project:${NC}"
@@ -2091,10 +2307,16 @@ switch_nextjs_development() {
         return 1
     fi
     
-    # Get domain from existing config atau use default
+    # Get domain from existing config or use default
     local domain="${project_name}.test"
     
-    setup_nextjs_development_mode "$project_name" "$domain"
+    # Check current SSL status
+    local enable_ssl="false"
+    if grep -q "listen 443 ssl" "/etc/nginx/sites-available/$domain" 2>/dev/null; then
+        enable_ssl="true"
+    fi
+    
+    setup_nextjs_development_mode "$project_name" "$domain" "$enable_ssl"
     
     echo -e "${ICON_SUCCESS} Now in DEVELOPMENT mode!"
     echo -e "${BLUE}Start development server:${NC}"
@@ -2102,7 +2324,11 @@ switch_nextjs_development() {
     echo "  npm run dev"
     echo ""
     echo -e "${BLUE}Access via:${NC}"
-    echo "  http://$domain (through proxy)"
+    if [ "$enable_ssl" = "true" ]; then
+        echo "  https://$domain (through proxy)"
+    else
+        echo "  http://$domain (through proxy)"
+    fi
     echo "  http://localhost:3001 (direct)"
 }
 
@@ -2133,23 +2359,33 @@ start_nextjs_watcher() {
         return 1
     fi
     
-    # Install dependencies jika belum
+    # Check SSL status for URL
+    local ssl_enabled="false"
+    if grep -q "listen 443 ssl" "/etc/nginx/sites-available/${project_name}.test" 2>/dev/null; then
+        ssl_enabled="true"
+    fi
+    
+    # Install dependencies if not installed
     if [ ! -d "node_modules" ]; then
         echo -e "${ICON_INFO} Installing dependencies..."
         npm install
     fi
     
-    # Build pertama kali
+    # Initial build
     echo -e "${ICON_INFO} Running initial build..."
     npm run build:production
     
     echo -e "${ICON_SUCCESS} Auto-build watcher started!"
     echo -e "${CYAN}Mode: PRODUCTION (Static files)${NC}"
     echo -e "${CYAN}Watching for file changes...${NC}"
-    echo -e "${CYAN}Access: http://${project_name}.test${NC}"
+    if [ "$ssl_enabled" = "true" ]; then
+        echo -e "${CYAN}Access: https://${project_name}.test${NC}"
+    else
+        echo -e "${CYAN}Access: http://${project_name}.test${NC}"
+    fi
     echo -e "${YELLOW}Press Ctrl+C to stop${NC}"
     
-    # Start file watcher dengan better output
+    # Start file watcher with better output
     npx chokidar 'pages/**/*' 'components/**/*' 'styles/**/*' 'app/**/*' 'public/**/*' \
         -c 'echo "📦 [$(date +"%T")] Changes detected → Rebuilding..." && npm run build:production && echo "✅ [$(date +"%T")] Build completed - Refresh browser!"'
 }
@@ -2183,10 +2419,430 @@ build_nextjs_production() {
     # Build production
     if npm run build:production; then
         echo -e "${ICON_SUCCESS} Production build completed!"
-        echo -e "${CYAN}Access: http://${project_name}.test${NC}"
+        # Check SSL status for URL
+        local ssl_enabled="false"
+        if grep -q "listen 443 ssl" "/etc/nginx/sites-available/${project_name}.test" 2>/dev/null; then
+            ssl_enabled="true"
+        fi
+        if [ "$ssl_enabled" = "true" ]; then
+            echo -e "${CYAN}Access: https://${project_name}.test${NC}"
+        else
+            echo -e "${CYAN}Access: http://${project_name}.test${NC}"
+        fi
     else
         echo -e "${ICON_ERROR} Build failed!"
         return 1
+    fi
+}
+
+# Function to repair/upgrade nginx configuration for all projects or specific project
+repair_nginx_config() {
+    local project_type=$1
+    local project_name=$2
+    
+    echo -e "${ICON_GEAR} Repairing/Upgrading Nginx configuration..."
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    # If specific project given
+    if [ -n "$project_type" ] && [ -n "$project_name" ]; then
+        local full_project_type=$(map_project_type "$project_type")
+        local domain="${project_name}.test"
+        
+        if ! project_exists "$full_project_type" "$project_name"; then
+            echo -e "${ICON_ERROR} Project not found: $project_type/$project_name"
+            return 1
+        fi
+        
+        echo -e "${ICON_INFO} Repairing configuration for: $project_type/$project_name"
+        
+        # Detect current SSL status
+        local ssl_enabled="false"
+        if [ -f "$NGINX_AVAILABLE/$domain" ] && grep -q "listen 443 ssl" "$NGINX_AVAILABLE/$domain"; then
+            ssl_enabled="true"
+        fi
+        
+        # Recreate nginx config with current settings
+        setup_nginx_config "$full_project_type" "$project_name" "$domain" "$ssl_enabled"
+        
+        echo -e "${ICON_SUCCESS} Configuration repaired for: $domain"
+        
+    else
+        # Repair all projects
+        echo -e "${ICON_INFO} Repairing all project configurations..."
+        local repaired=0
+        local failed=0
+        
+        for project_type in laravel nextjs codeigniter3; do
+            if [ -d "$PROJECTS_ROOT/$project_type" ]; then
+                find "$PROJECTS_ROOT/$project_type" -maxdepth 1 -type d | tail -n +2 | while read dir; do
+                    local name=$(basename "$dir")
+                    local domain="${name}.test"
+                    local full_project_type=$(map_project_type "$project_type")
+                    
+                    echo -e "${ICON_GEAR} Repairing: $project_type/$name"
+                    
+                    # Detect current SSL status
+                    local ssl_enabled="false"
+                    if [ -f "$NGINX_AVAILABLE/$domain" ] && grep -q "listen 443 ssl" "$NGINX_AVAILABLE/$domain"; then
+                        ssl_enabled="true"
+                    fi
+                    
+                    # Backup old config
+                    if [ -f "$NGINX_AVAILABLE/$domain" ]; then
+                        sudo cp "$NGINX_AVAILABLE/$domain" "$NGINX_AVAILABLE/${domain}.backup"
+                    fi
+                    
+                    # Recreate config
+                    if setup_nginx_config "$full_project_type" "$name" "$domain" "$ssl_enabled"; then
+                        ((repaired++))
+                        echo -e "${ICON_CHECK} Repaired: $domain"
+                    else
+                        ((failed++))
+                        echo -e "${ICON_ERROR} Failed to repair: $domain"
+                    fi
+                done
+            fi
+        done
+        
+        echo ""
+        echo -e "${ICON_SUCCESS} Repair completed!"
+        echo -e "${ICON_INFO} Repaired: $repaired projects"
+        if [ $failed -gt 0 ]; then
+            echo -e "${ICON_WARN} Failed: $failed projects"
+        fi
+    fi
+}
+
+# Function to upgrade/change PHP version
+upgrade_php_version() {
+    local project_type=$1
+    local project_name=$2
+    local target_version=$3
+    
+    if [ -z "$target_version" ]; then
+        echo -e "${ICON_ERROR} Usage: upgrade_php <laravel|ci3> <project-name> <php-version>"
+        echo "Example: upgrade_php laravel myapp 8.5"
+        echo "Example: upgrade_php ci3 myapp 8.2"
+        return 1
+    fi
+    
+    # Check if project exists
+    local full_project_type=$(map_project_type "$project_type")
+    if ! project_exists "$full_project_type" "$project_name"; then
+        echo -e "${ICON_ERROR} Project not found: $project_type/$project_name"
+        return 1
+    fi
+    
+    echo -e "${ICON_GEAR} Upgrading PHP version for: $project_type/$project_name"
+    echo -e "${ICON_INFO} Target PHP Version: $target_version"
+    
+    # Check if target PHP-FPM exists
+    local socket_path="/run/php/php${target_version}-fpm.sock"
+    if [ ! -S "$socket_path" ]; then
+        # Try fallback location
+        socket_path="/var/run/php/php${target_version}-fpm.sock"
+        if [ ! -S "$socket_path" ]; then
+            echo -e "${ICON_WARN} Socket not found: /run/php/php${target_version}-fpm.sock or /var/run/php/php${target_version}-fpm.sock"
+            
+            # Check if service exists
+            if systemctl list-units --all --type=service --no-pager 2>/dev/null | grep -q "php${target_version}-fpm"; then
+                echo -e "${ICON_INFO} Service exists but not running. Starting..."
+                sudo systemctl start "php${target_version}-fpm"
+                sleep 2
+                if [ ! -S "$socket_path" ]; then
+                    echo -e "${ICON_ERROR} Failed to start PHP ${target_version} FPM"
+                    echo -e "${ICON_INFO} Available PHP versions:"
+                    ls /run/php/php*-fpm.sock 2>/dev/null | grep -oP 'php\K[0-9.]+' || echo "No PHP-FPM services found"
+                    return 1
+                fi
+            else
+                echo -e "${ICON_ERROR} PHP ${target_version} FPM not installed"
+                echo -e "${ICON_INFO} Available PHP versions:"
+                ls /run/php/php*-fpm.sock 2>/dev/null | grep -oP 'php\K[0-9.]+' || echo "No PHP-FPM services found"
+                return 1
+            fi
+        fi
+    fi
+    
+    # Update project PHP version
+    local project_path="$PROJECTS_ROOT/$full_project_type/$project_name"
+    
+    # For Laravel: Update .env PHP version
+    if [ "$full_project_type" = "laravel" ]; then
+        if [ -f "$project_path/.env" ]; then
+            sed -i "s/^PHP_VERSION=.*/PHP_VERSION=${target_version}/" "$project_path/.env"
+            echo -e "${ICON_CHECK} Updated .env PHP_VERSION to $target_version"
+        fi
+        
+        # Update composer.json
+        if [ -f "$project_path/composer.json" ]; then
+            sed -i "s/\"php\": \".*\"/\"php\": \">=${target_version}\"/" "$project_path/composer.json"
+            echo -e "${ICON_CHECK} Updated composer.json PHP requirement"
+        fi
+    fi
+    
+    # Recreate nginx config with new PHP version
+    local domain="${project_name}.test"
+    local ssl_enabled="false"
+    if [ -f "$NGINX_AVAILABLE/$domain" ] && grep -q "listen 443 ssl" "$NGINX_AVAILABLE/$domain"; then
+        ssl_enabled="true"
+    fi
+    
+    # Force set PHP version for this project
+    setup_nginx_config "$full_project_type" "$project_name" "$domain" "$ssl_enabled"
+    
+    echo -e "${ICON_SUCCESS} PHP version upgraded to $target_version"
+    echo -e "${ICON_INFO} Project: $project_path"
+    echo -e "${ICON_CODE} PHP-FPM: $target_version via $socket_path"
+}
+
+# Function to change PHP version interactively
+change_php_version() {
+    local project_type=$1
+    local project_name=$2
+    
+    if [ -z "$project_type" ] || [ -z "$project_name" ]; then
+        echo -e "${ICON_ERROR} Usage: change_php <laravel|ci3> <project-name>"
+        return 1
+    fi
+    
+    local full_project_type=$(map_project_type "$project_type")
+    if ! project_exists "$full_project_type" "$project_name"; then
+        echo -e "${ICON_ERROR} Project not found: $project_type/$project_name"
+        return 1
+    fi
+    
+    echo -e "${ICON_GEAR} Changing PHP version for: $project_type/$project_name"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    # Get available PHP versions from both paths
+    local available_versions=()
+    local socket_files=$(ls /run/php/php*-fpm.sock 2>/dev/null)
+    if [ -z "$socket_files" ]; then
+        socket_files=$(ls /var/run/php/php*-fpm.sock 2>/dev/null)
+    fi
+    
+    if [ -z "$socket_files" ]; then
+        echo -e "${ICON_ERROR} No PHP-FPM services found"
+        return 1
+    fi
+    
+    # Parse available versions
+    for socket in $socket_files; do
+        local version=$(basename "$socket" | grep -oP 'php\K[0-9.]+')
+        if [ -n "$version" ]; then
+            available_versions+=("$version")
+        fi
+    done
+    
+    # Sort versions
+    IFS=$'\n' available_versions=($(sort -V <<<"${available_versions[*]}"))
+    
+    echo -e "${CYAN}Available PHP Versions:${NC}"
+    local i=1
+    for version in "${available_versions[@]}"; do
+        local status=""
+        if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
+            status=" (RUNNING)"
+        else
+            status=" (STOPPED)"
+        fi
+        echo "  $i) PHP $version$status"
+        ((i++))
+    done
+    
+    echo ""
+    echo -e "${YELLOW}Enter version number to switch (1-${#available_versions[@]}):${NC} "
+    read -r choice
+    
+    # Validate input
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#available_versions[@]} ]; then
+        echo -e "${ICON_ERROR} Invalid selection"
+        return 1
+    fi
+    
+    local selected_version="${available_versions[$((choice-1))]}"
+    echo -e "${ICON_INFO} Selected PHP: $selected_version"
+    
+    # Upgrade to selected version
+    upgrade_php_version "$project_type" "$project_name" "$selected_version"
+}
+
+# Function to list all PHP versions available
+list_php_versions() {
+    echo -e "${CYAN}${ICON_CODE} PHP VERSIONS STATUS${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Check via sockets - primary path
+    echo -e "${ICON_INFO} PHP-FPM Sockets (/run/php):"
+    local socket_files=$(ls /run/php/php*-fpm.sock 2>/dev/null)
+    if [ -n "$socket_files" ]; then
+        for socket in $socket_files; do
+            local version=$(basename "$socket" | grep -oP 'php\K[0-9.]+')
+            local status=""
+            local service="php${version}-fpm"
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                status="${GREEN}RUNNING${NC}"
+            else
+                status="${RED}STOPPED${NC}"
+            fi
+            echo -e "   PHP $version: $status (socket: $socket)"
+        done
+    else
+        echo -e "   ${ICON_WARN} No PHP-FPM sockets found in /run/php"
+    fi
+    
+    echo ""
+    echo -e "${ICON_INFO} PHP-FPM Services:"
+    local services=$(systemctl list-units --all --type=service --no-pager 2>/dev/null | grep "php.*-fpm")
+    if [ -n "$services" ]; then
+        echo "$services" | while read line; do
+            echo "   $line"
+        done
+    else
+        echo -e "   ${ICON_WARN} No PHP-FPM services found"
+    fi
+    
+    echo ""
+    echo -e "${ICON_INFO} PHP CLI Version:"
+    if command -v php &> /dev/null; then
+        php -v 2>&1 | head -1
+    else
+        echo -e "   ${ICON_WARN} PHP CLI not found"
+    fi
+}
+
+# Function to repair SSL certificates for project
+repair_ssl() {
+    local project_type=$1
+    local project_name=$2
+    local domain=${3:-"${project_name}.test"}
+    
+    if [ -z "$project_type" ] || [ -z "$project_name" ]; then
+        echo -e "${ICON_ERROR} Usage: repair_ssl <laravel|nextjs|ci3> <project-name> [domain]"
+        return 1
+    fi
+    
+    local full_project_type=$(map_project_type "$project_type")
+    
+    if ! project_exists "$full_project_type" "$project_name"; then
+        echo -e "${ICON_ERROR} Project not found: $PROJECTS_ROOT/$full_project_type/$project_name"
+        return 1
+    fi
+    
+    echo -e "${ICON_GEAR} Repairing SSL for: $project_type/$project_name"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    # Remove old certificates
+    if [ -f "$CERT_ROOT/$domain.pem" ]; then
+        echo -e "${ICON_INFO} Removing old certificate..."
+        rm -f "$CERT_ROOT/$domain.pem"
+        rm -f "$CERT_ROOT/$domain-key.pem"
+    fi
+    
+    # Generate new certificate
+    if generate_ssl_cert "$domain"; then
+        echo -e "${ICON_CHECK} New SSL certificate generated"
+        
+        # Recreate nginx config with SSL
+        setup_nginx_config "$full_project_type" "$project_name" "$domain" "true"
+        
+        echo -e "${ICON_SUCCESS} SSL repaired for: $domain"
+        echo -e "${ICON_NETWORK} Access: https://$domain"
+    else
+        echo -e "${ICON_ERROR} Failed to repair SSL for: $domain"
+        return 1
+    fi
+}
+
+# Function to check and validate current configuration
+check_config() {
+    local project_type=$1
+    local project_name=$2
+    
+    echo -e "${ICON_GEAR} Checking configuration..."
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    if [ -n "$project_type" ] && [ -n "$project_name" ]; then
+        # Check specific project
+        local full_project_type=$(map_project_type "$project_type")
+        local domain="${project_name}.test"
+        local project_path="$PROJECTS_ROOT/$full_project_type/$project_name"
+        
+        if [ ! -d "$project_path" ]; then
+            echo -e "${ICON_ERROR} Project not found: $project_path"
+            return 1
+        fi
+        
+        echo -e "${ICON_INFO} Checking project: $full_project_type/$project_name"
+        echo -e "${ICON_INFO} Path: $project_path"
+        
+        # Check nginx config
+        if [ -f "$NGINX_AVAILABLE/$domain" ]; then
+            echo -e "${ICON_CHECK} Nginx config exists: $NGINX_AVAILABLE/$domain"
+            
+            # Check SSL
+            if grep -q "ssl_certificate" "$NGINX_AVAILABLE/$domain"; then
+                local cert_path=$(grep "ssl_certificate" "$NGINX_AVAILABLE/$domain" | head -1 | awk '{print $2}' | tr -d ';')
+                if [ -f "$cert_path" ]; then
+                    echo -e "${ICON_CHECK} SSL certificate found: $cert_path"
+                else
+                    echo -e "${ICON_ERROR} SSL certificate not found: $cert_path"
+                fi
+            else
+                echo -e "${ICON_WARN} SSL not configured"
+            fi
+            
+            # Check PHP-FPM
+            if grep -q "fastcgi_pass" "$NGINX_AVAILABLE/$domain"; then
+                local fpm_connection=$(grep "fastcgi_pass" "$NGINX_AVAILABLE/$domain" | head -1 | awk '{print $2}' | tr -d ';')
+                echo -e "${ICON_INFO} PHP-FPM: $fpm_connection"
+                
+                if [[ "$fpm_connection" == unix:* ]]; then
+                    local socket_path="${fpm_connection#unix:}"
+                    if [ -S "$socket_path" ]; then
+                        echo -e "${ICON_CHECK} Socket exists: $socket_path"
+                    else
+                        echo -e "${ICON_ERROR} Socket not found: $socket_path"
+                    fi
+                fi
+            fi
+        else
+            echo -e "${ICON_ERROR} Nginx config not found: $NGINX_AVAILABLE/$domain"
+        fi
+        
+        # Check symlink
+        if [ -L "$NGINX_ENABLED/$domain" ]; then
+            echo -e "${ICON_CHECK} Site enabled: $NGINX_ENABLED/$domain"
+        else
+            echo -e "${ICON_ERROR} Site not enabled"
+        fi
+        
+    else
+        # Check all projects
+        echo -e "${ICON_INFO} Checking all projects..."
+        for project_type in laravel nextjs codeigniter3; do
+            if [ -d "$PROJECTS_ROOT/$project_type" ]; then
+                find "$PROJECTS_ROOT/$project_type" -maxdepth 1 -type d | tail -n +2 | while read dir; do
+                    local name=$(basename "$dir")
+                    local domain="${name}.test"
+                    echo ""
+                    echo -e "${CYAN}Checking: $project_type/$name${NC}"
+                    
+                    if [ -f "$NGINX_AVAILABLE/$domain" ]; then
+                        echo -e "  ${ICON_CHECK} Config exists"
+                        if grep -q "ssl_certificate" "$NGINX_AVAILABLE/$domain"; then
+                            echo -e "  ${ICON_SECURITY} SSL enabled"
+                        else
+                            echo -e "  ${ICON_WARN} SSL disabled"
+                        fi
+                    else
+                        echo -e "  ${ICON_ERROR} Config missing"
+                    fi
+                done
+            fi
+        done
     fi
 }
 
@@ -2224,6 +2880,14 @@ show_detailed_help() {
     echo "  project watch-nextjs <name>"
     echo "  project build-nextjs <name>"
     echo ""
+    echo -e "${YELLOW}REPAIR & UPGRADE COMMANDS:${NC}"
+    echo "  project repair [type] [name]"
+    echo "  project upgrade-php <type> <name> <version>"
+    echo "  project change-php <type> <name>"
+    echo "  project php-list"
+    echo "  project repair-ssl <type> <name> [domain]"
+    echo "  project check-config [type] [name]"
+    echo ""
     echo -e "${YELLOW}QUICK ALIASES:${NC}"
     echo "  ${GREEN}Project Management:${NC}"
     echo "  pj-create <type> <name> <domain> [ssl]"
@@ -2260,6 +2924,14 @@ show_detailed_help() {
     echo "  pj-watch-nextjs <name>"
     echo "  pj-build-nextjs <name>"
     echo ""
+    echo "  ${PURPLE}Repair Aliases:${NC}"
+    echo "  pj-repair [type] [name]         - Repair nginx config"
+    echo "  pj-upgrade-php <type> <name> <version> - Upgrade PHP version"
+    echo "  pj-change-php <type> <name>     - Change PHP version interactive"
+    echo "  pj-php-list                     - List PHP versions"
+    echo "  pj-repair-ssl <type> <name> [domain] - Repair SSL certificate"
+    echo "  pj-check-config [type] [name]   - Check configuration"
+    echo ""
     echo -e "${BLUE}EXAMPLES:${NC}"
     echo "  ${GREEN}Basic Usage:${NC}"
     echo "  pj-create laravel myapp myapp.test"
@@ -2282,6 +2954,15 @@ show_detailed_help() {
     echo "  pj-network-status"
     echo "  pj-restart-services"
     echo "  pj-fix-home-permission"
+    echo ""
+    echo "  ${PURPLE}Repair Examples:${NC}"
+    echo "  pj-repair                       # Repair all projects"
+    echo "  pj-repair laravel myapp         # Repair specific project"
+    echo "  pj-upgrade-php laravel myapp 8.5 # Upgrade PHP to 8.5"
+    echo "  pj-change-php laravel myapp     # Interactive PHP version change"
+    echo "  pj-php-list                     # List all PHP versions"
+    echo "  pj-repair-ssl ci3 myapp         # Repair SSL certificate"
+    echo "  pj-check-config laravel myapp   # Check project configuration"
     echo ""
     echo -e "${PURPLE}PROJECT TYPES:${NC}"
     echo "  laravel, nextjs, ci3 (codeigniter3)"
@@ -2321,10 +3002,12 @@ show_detailed_help() {
     echo "  ❌ SSL certificate warnings"
     echo "     → pj-trust-setup"
     echo "     → pj-mkcert-setup"
+    echo "     → pj-repair-ssl <type> <name>"
     echo ""
     echo "  ❌ Nginx configuration errors"
     echo "     → pj-fix <type> <name>"
     echo "     → pj-troubleshoot domain.test"
+    echo "     → pj-check-config <type> <name>"
     echo ""
     echo -e "${GREEN}QUICK START FOR NEXT.JS:${NC}"
     echo "  1. pj-create nextjs mynextapp mynextapp.test"
@@ -2425,6 +3108,24 @@ project_manager() {
             ;;
         "help"|"--help"|"-h")
             show_detailed_help
+            ;;
+        "repair")
+            repair_nginx_config $2 $3
+            ;;
+        "upgrade-php")
+            upgrade_php_version $2 $3 $4
+            ;;
+        "change-php")
+            change_php_version $2 $3
+            ;;
+        "php-list")
+            list_php_versions
+            ;;
+        "repair-ssl")
+            repair_ssl $2 $3 $4
+            ;;
+        "check-config")
+            check_config $2 $3
             ;;
         *)
             # Jika tidak ada argumen, show help
